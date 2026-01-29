@@ -1,0 +1,8 @@
+.venv
+
+.env
+
+output.md
+*debug*
+
+*__pycache__*
