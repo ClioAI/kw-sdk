@@ -49,13 +49,27 @@ This SDK implements a **self-verifying agentic loop** that brings structure to t
 
 ## Installation
 
+### As a dependency (recommended)
+
+```bash
+uv pip install git+https://github.com/ClioAI/kw-sdk.git
+```
+
+Or add to your `pyproject.toml`:
+
+```toml
+dependencies = [
+    "verif @ git+https://github.com/ClioAI/kw-sdk.git",
+]
+```
+
+### For development
+
 ```bash
 git clone https://github.com/ClioAI/kw-sdk.git
 cd kw-sdk
-
-uv venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 ```
 
 Create a `.env` file:
