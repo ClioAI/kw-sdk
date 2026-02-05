@@ -127,7 +127,11 @@ for f in ARTIFACTS_DIR.iterdir():
     print(f"  - {f.name} ({f.stat().st_size} bytes)")
 
 # Save execution trace
-with open("with_files_output.md", "w") as f:
+output_dir = Path(__file__).parent / "outputs"
+output_dir.mkdir(exist_ok=True)
+output_file = output_dir / "with_files_output.md"
+
+with open(output_file, "w") as f:
     f.write("# File Processing Example\n\n")
     f.write(f"## Input File\n`{SAMPLE_FILE}`\n\n")
     f.write(f"## Analysis\n{result.answer}\n\n")
@@ -135,4 +139,4 @@ with open("with_files_output.md", "w") as f:
     f.write("## Execution Trace\n\n")
     f.write(harness.get_history_markdown())
 
-print(f"\nFull trace saved to with_files_output.md")
+print(f"\nFull trace saved to {output_file}")
