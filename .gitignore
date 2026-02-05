@@ -6,3 +6,4 @@ output.md
 *debug*
 
 *__pycache__*
+.DS_Store
