@@ -177,7 +177,12 @@ See: [examples/plan_mode.py](examples/plan_mode.py)
 
 ### Explore Mode
 
-For divergent thinking—generate multiple distinct perspectives.
+For divergent thinking—generate multiple distinct perspectives. Unlike standard mode, explore doesn't optimize for a single "right" answer. It maps the solution space.
+
+**How explore differs from standard:**
+- **No accuracy rubric.** Standard mode creates a rubric to verify correctness. Explore uses a quality checklist—are the takes distinct? Do they cover different assumptions?
+- **Forces gap identification.** Each take must state its assumptions and what would break it. This surfaces blind spots you wouldn't find with a single answer.
+- **Quantity over convergence.** Standard iterates toward one verified answer. Explore produces N parallel answers that may contradict each other—that's the point.
 
 ```python
 from verif import RLHarness
@@ -199,8 +204,12 @@ for i, take in enumerate(takes, 1):
 
 Each take includes:
 - The solution/recommendation
-- **Assumptions**: What must be true for this to work
-- **Counterfactual**: What could make this fail
+- **Assumptions**: What must be true for this to work (e.g., "assumes budget for multi-region replication")
+- **Counterfactual**: What could make this fail (e.g., "breaks if latency requirements tighten to <10ms")
+
+The output ends with **set-level gaps**: what's missing from the entire set? This tells you which angles weren't covered—maybe all takes assumed a single cloud provider, or none considered regulatory constraints. The gaps are often more valuable than the takes themselves.
+
+Use explore when you're not sure what the right question is, or when the "best" answer depends on unstated constraints.
 
 See: [examples/explore_mode.py](examples/explore_mode.py)
 
