@@ -261,73 +261,108 @@ class OpenRouterProvider(OpenAIProvider):
 ## Adding a New Mode
 
 Modes define how the orchestrator executes tasks. Each mode specifies:
-
-> **Example:** See [examples/custom_mode_bizarro.py](examples/custom_mode_bizarro.py) for a complete working example of runtime mode registration.
 - Which tools are available
 - Which prompts to use
 - How rubrics are handled
 - What kwargs get passed to prompts
 
-### 1. Define the Mode Config
+> **Example:** See [examples/custom_mode_bizarro.py](examples/custom_mode_bizarro.py) for a complete working example.
 
-In `verif/modes.py`, add a new `ModeConfig`:
+### Runtime Registration (SDK Usage)
+
+When using the SDK as a dependency, register modes at runtime by importing and modifying the registries:
 
 ```python
+from verif import RLHarness, ProviderConfig
+from verif.config import ModeConfig
+from verif.modes import MODES
+from verif.providers.base import PROMPTS
+
+# 1. Define your orchestrator prompt
+MY_ORCHESTRATOR = """You are a specialized orchestrator for {task}.
+
+## Your Custom Workflow
+1. Do step one
+2. Do step two
+3. Verify and submit
+
+## Tools
+- spawn_subagent: Delegate work
+- verify_answer: Check against rubric
+- submit_answer: Submit final answer
+"""
+
+# 2. Define the mode config
 MY_MODE = ModeConfig(
     name="my_mode",
+    orchestrator_prompt="MY_ORCHESTRATOR",  # Key in PROMPTS dict
+    brief_prompt=None,                       # Optional
+    tools=["spawn_subagent", "verify_answer", "submit_answer"],
+    verification_tool="verify_answer",
+    rubric_strategy="create",  # "create" | "provided" | "skip"
+    has_pre_execution=False,
+    prompt_kwargs=[],
+)
+
+# 3. Register at runtime (before creating harness)
+PROMPTS["MY_ORCHESTRATOR"] = MY_ORCHESTRATOR
+MODES["my_mode"] = MY_MODE
+
+# 4. Use it
+harness = RLHarness(provider="gemini")
+result = harness.run_single(task, mode="my_mode")
+```
+
+### ModeConfig Reference
+
+```python
+ModeConfig(
+    name="my_mode",
     
-    # Prompt keys (resolved from verif/prompts.py at runtime)
-    orchestrator_prompt="MY_ORCHESTRATOR",  # Main orchestrator prompt
-    brief_prompt="MY_BRIEF",                 # Brief creation prompt (if used)
+    # Prompt keys (must exist in PROMPTS dict)
+    orchestrator_prompt="MY_ORCHESTRATOR",
+    brief_prompt="MY_BRIEF",  # Optional: for create_brief tool
     
-    # Tools available in this mode
+    # Tools available to orchestrator
     tools=[
-        "create_brief",      # Optional: create structured brief
-        "create_rubric",     # Optional: create verification rubric
+        "create_brief",      # Formalize task requirements
+        "create_rubric",     # Generate evaluation criteria
         "spawn_subagent",    # Delegate subtasks
-        "verify_answer",     # Verification tool
-        "submit_answer",     # Submit final answer
+        "search_web",        # Web search (if enable_search=True)
+        "search_files",      # File access (if enable_bash=True)
+        "execute_code",      # Python REPL (if enable_code=True)
+        "ask_user",          # User clarification (if enable_ask_user=True)
+        "verify_answer",     # Standard verification
+        "verify_exploration",# Explore mode verification
+        "submit_answer",     # Final submission
     ],
     
     # Verification
-    verification_tool="verify_answer",  # or "verify_exploration"
+    verification_tool="verify_answer",  # or "verify_exploration" or None
     
     # Rubric strategy
-    rubric_strategy="create",  # "create" | "provided" | "skip"
-    # - "create": Orchestrator creates rubric during execution
-    # - "provided": Caller provides rubric (or orchestrator creates if missing)
-    # - "skip": No rubric (e.g., explore mode uses checklist verifier)
+    rubric_strategy="create",
+    # - "create": Orchestrator calls create_rubric during execution
+    # - "provided": Caller provides rubric, or orchestrator creates if missing
+    # - "skip": No rubric (uses custom verifier like explore mode)
     
-    # Pre-execution phase
-    has_pre_execution=False,  # True if mode needs setup before main loop
+    # Pre-execution phase (for future use)
+    has_pre_execution=False,
     
-    # Kwargs formatted into the orchestrator prompt
-    prompt_kwargs=["task", "custom_param"],  # {task} and {custom_param} in prompt
+    # Kwargs formatted into orchestrator prompt via {key}
+    prompt_kwargs=["custom_param"],  # Passed from run_single()
 )
 ```
 
-### 2. Register the Mode
+### Creating the Orchestrator Prompt
 
-Add to the `MODES` registry in `verif/modes.py`:
-
-```python
-MODES: dict[str, ModeConfig] = {
-    "standard": STANDARD_MODE,
-    "plan": PLAN_MODE,
-    "explore": EXPLORE_MODE,
-    "iterate": ITERATE_MODE,
-    "my_mode": MY_MODE,  # Add this
-}
-```
-
-### 3. Create the Orchestrator Prompt
-
-In `verif/prompts.py`, add your orchestrator prompt:
+Your prompt should:
+1. Describe the workflow clearly
+2. List available tools with usage guidance
+3. End with clear success criteria
 
 ```python
 MY_ORCHESTRATOR = """You are an orchestrator for {task}.
-
-Custom parameter: {custom_param}
 
 ## Available Tools
 - spawn_subagent: Delegate research or writing tasks
@@ -339,44 +374,54 @@ Custom parameter: {custom_param}
 2. Execute using subagents
 3. Verify your answer
 4. Submit when verification passes
+
+IMPORTANT: Call tools directly. Do not describe what you will do.
 """
+
+# Register before use
+PROMPTS["MY_ORCHESTRATOR"] = MY_ORCHESTRATOR
 ```
 
-### 4. Handle Mode-Specific Logic (Optional)
+### Modes Without Verification
 
-If your mode needs special handling in the harness, update `run_single()` in `verif/harness.py`:
+For modes that skip verification (like fact-checking where the task *is* verification):
 
 ```python
-def run_single(
-    self,
-    task: Prompt,
-    mode: str | None = None,
-    # Add your mode's kwargs
-    custom_param: str | None = None,
+FACT_CHECK_MODE = ModeConfig(
+    name="fact_check",
+    orchestrator_prompt="FACT_CHECKER",
+    tools=["search_web", "spawn_subagent", "submit_answer"],
+    verification_tool=None,  # No verification step
+    rubric_strategy="skip",
+    has_pre_execution=False,
+    prompt_kwargs=[],
+)
+```
+
+### Passing Custom Parameters
+
+If your mode needs custom parameters, include them in `prompt_kwargs` and pass via `run_single()`:
+
+```python
+# Mode config
+MY_MODE = ModeConfig(
+    name="my_mode",
+    orchestrator_prompt="MY_ORCHESTRATOR",  # Contains {custom_param}
+    tools=["spawn_subagent", "submit_answer"],
+    prompt_kwargs=["custom_param"],  # Will be formatted into prompt
     ...
-) -> RunResult:
-    mode_name = mode or self.default_mode
-    mode_config = get_mode(mode_name)
-    
-    mode_kwargs = {}
-    
-    # Handle your mode
-    if mode_config.name == "my_mode":
-        if not custom_param:
-            raise ValueError("my_mode requires custom_param")
-        mode_kwargs["custom_param"] = custom_param
-    
-    # ... rest of method
-```
+)
 
-### 5. Use It
+# Prompt with placeholder
+MY_ORCHESTRATOR = """You are working on {task}.
+Target audience: {custom_param}
+..."""
 
-```python
-harness = RLHarness(provider="gemini")
+# Usage - pass as kwarg
 result = harness.run_single(
-    task="Do something custom",
+    task="Write a report",
     mode="my_mode",
-    custom_param="value",
+    custom_param="technical executives",
 )
 ```
 
