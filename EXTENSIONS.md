@@ -261,6 +261,8 @@ class OpenRouterProvider(OpenAIProvider):
 ## Adding a New Mode
 
 Modes define how the orchestrator executes tasks. Each mode specifies:
+
+> **Example:** See [examples/custom_mode_bizarro.py](examples/custom_mode_bizarro.py) for a complete working example of runtime mode registration.
 - Which tools are available
 - Which prompts to use
 - How rubrics are handled

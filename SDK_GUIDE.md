@@ -102,6 +102,7 @@ harness = RLHarness(
     enable_search=True,     # Web search tool
     enable_bash=False,      # Filesystem navigation (ls, find, grep, cat)
     enable_code=False,      # Python code execution
+    enable_ask_user=False,  # User clarification tool
     
     # Code Execution (required if enable_code=True)
     code_executor=SubprocessExecutor("./artifacts"),
@@ -265,12 +266,72 @@ print(result.answer)
 
 ### Supported Attachment Types
 
-| Type | MIME Type | Notes |
-|------|-----------|-------|
-| Text | `text/plain` | Use `preview` for first N lines |
-| Images | `image/png`, `image/jpeg` | Vision-capable models |
-| PDFs | `application/pdf` | Extracted via vision |
-| Spreadsheets | Use `search_files` | Read with bash tools |
+| Type | MIME Type | Handling |
+|------|-----------|----------|
+| Images | `image/png`, `image/jpeg`, `image/gif`, `image/webp` | Sent directly to model vision |
+| Text | `text/plain`, `text/markdown`, `text/csv` | Use `preview` field for content |
+| PDFs | `application/pdf` | Requires `enable_bash=True` to read |
+| Other | Any | Requires `preview` or `enable_bash=True` |
+
+**Important:** Only images are sent directly to the model. For all other file types:
+- Provide `preview` with the file content (model sees this immediately)
+- Or enable `enable_bash=True` so the orchestrator can read files via `search_files`
+
+```python
+# Good: Text file with preview
+attachment = Attachment(
+    content="/path/to/doc.md",
+    mime_type="text/markdown",
+    name="doc.md",
+    preview=Path("/path/to/doc.md").read_text(),  # Model sees this
+)
+
+# Good: Image (no preview needed)
+image = Attachment(
+    content="/path/to/chart.png",
+    mime_type="image/png",
+    name="chart.png",
+)
+
+# Requires enable_bash: PDF without preview
+pdf = Attachment(
+    content="/path/to/report.pdf",
+    mime_type="application/pdf",
+    name="report.pdf",
+)
+# Model will call search_files to read it
+```
+
+**For complex files, preprocess first.** Don't rely on the model to parse PDFs, spreadsheets, or binary formats. Extract content yourself and pass as text:
+
+```python
+import pdfplumber  # or PyMuPDF, pdfminer, etc.
+
+# Preprocess PDF → text
+with pdfplumber.open("report.pdf") as pdf:
+    text = "\n".join(page.extract_text() for page in pdf.pages)
+
+attachment = Attachment(
+    content="report.pdf",
+    mime_type="text/plain",  # Now it's text
+    name="report.pdf",
+    preview=text,  # Extracted content
+)
+
+# Preprocess Excel → CSV or markdown table
+import pandas as pd
+df = pd.read_excel("data.xlsx")
+preview = df.to_markdown()  # or df.to_csv()
+
+attachment = Attachment(
+    content="data.xlsx",
+    mime_type="text/markdown",
+    name="data.xlsx", 
+    preview=preview,
+)
+```
+
+This gives you control over extraction quality and reduces model errors.
 
 ---
 
@@ -324,6 +385,7 @@ print(f"Event summary: {event_counts}")
 | `subagent_start` | Subagent spawned |
 | `subagent_chunk` | Subagent streaming |
 | `subagent_end` | Subagent complete |
+| `user_question` | ask_user questions pending response |
 
 ---
 
@@ -384,6 +446,70 @@ class MyExecutor:
         # Reset state
         pass
 ```
+
+### Remote Executor (Frontend Delegation)
+
+For browser-based sandboxed execution, use `RemoteExecutor` to delegate code execution to the frontend via SSE events:
+
+```python
+from verif.executor import RemoteExecutor
+
+def emit_sse_event(event_type: str, data: dict):
+    """Your SSE emit function."""
+    pass
+
+executor = RemoteExecutor(
+    session_id="session-123",
+    emit_event=emit_sse_event,
+    timeout=30,
+    sandbox_config={
+        "type": "pyodide",
+        "packages": ["pandas", "numpy"],
+        "constraints": "No network access",
+    },
+)
+
+# Executor emits 'tool_request' events, expects responses via receive_response()
+executor.receive_response(request_id, {"success": True, "data": {"stdout": "..."}})
+```
+
+---
+
+## User Clarification (ask_user)
+
+Enable interactive clarification for ambiguous tasks:
+
+```python
+import threading
+from verif import RLHarness, ProviderConfig
+
+def on_event(entry, harness):
+    if entry.entry_type == "user_question":
+        question_id = entry.metadata["question_id"]
+        questions = entry.metadata["questions"]
+        context = entry.metadata.get("context", "")
+        
+        # Collect or generate answers
+        answers = {0: "B2B SaaS platform", 1: "$50,000 budget"}
+        
+        # Send response back (threaded to avoid blocking)
+        threading.Thread(
+            target=lambda: harness.provider.receive_user_response(question_id, answers)
+        ).start()
+
+harness = RLHarness(
+    provider=ProviderConfig(name="gemini", thinking_level="MEDIUM"),
+    enable_ask_user=True,
+    on_event=lambda e: on_event(e, harness),
+)
+
+result = harness.run_single("Create a detailed project plan for my product launch.")
+```
+
+Key behaviors:
+- `verify_answer` blocks until all pending questions are answered
+- User clarifications are included in verification context
+- Answers are keyed by question index (0, 1, 2...)
 
 ---
 
@@ -470,6 +596,89 @@ config = RLHarness.get_mode_config("plan")
 print(config.tools)  # ['create_rubric', 'spawn_subagent', ...]
 ```
 
+### Custom Modes
+
+Create custom execution modes by registering prompts and ModeConfig:
+
+```python
+from verif import RLHarness, ProviderConfig
+from verif.config import ModeConfig
+from verif.modes import MODES
+from verif.providers.base import PROMPTS
+
+# Define custom prompts
+BIZARRO_ORCHESTRATOR = """You are BIZARRO orchestrator. Everything is OPPOSITE.
+To find the best answer, first find the WORST answer..."""
+
+BIZARRO_BRIEF = """Create an ANTI-BRIEF identifying everything that could go WRONG..."""
+
+# Define mode config
+BIZARRO_MODE = ModeConfig(
+    name="bizarro",
+    orchestrator_prompt="BIZARRO_ORCHESTRATOR",
+    brief_prompt="BIZARRO_BRIEF",
+    tools=["create_brief", "create_rubric", "spawn_subagent", "verify_answer", "submit_answer"],
+    verification_tool="verify_answer",
+    rubric_strategy="create",
+    has_pre_execution=False,
+    prompt_kwargs=[],
+)
+
+# Register at runtime
+PROMPTS["BIZARRO_ORCHESTRATOR"] = BIZARRO_ORCHESTRATOR
+PROMPTS["BIZARRO_BRIEF"] = BIZARRO_BRIEF
+MODES["bizarro"] = BIZARRO_MODE
+
+# Use like any built-in mode
+harness = RLHarness(provider="gemini", default_mode="bizarro")
+result = harness.run_single(task, mode="bizarro")
+```
+
+See: [examples/custom_mode_bizarro.py](examples/custom_mode_bizarro.py)
+
+---
+
+## Patterns
+
+### Pre-built Utils + execute_code (No Custom Tools Needed)
+
+Instead of creating MCP servers, document utility functions and let the model call them:
+
+```python
+WEATHER_UTILS_DOCS = """
+## Available: Weather Utilities
+```python
+from utils.weather import get_current, get_forecast, compare_cities
+get_current("London")  # {"city": "London", "temp": 15.2, ...}
+```
+"""
+
+task = f"Recommend a travel destination based on weather.\n\n{WEATHER_UTILS_DOCS}"
+result = harness.run_single(task)  # Model imports and calls your tested code
+```
+
+See: [examples/no_tools_needed.py](examples/no_tools_needed.py)
+
+### Docs as File Attachment
+
+Keep documentation alongside code and attach to prompts:
+
+```python
+from verif import Attachment, Prompt
+
+docs_attachment = Attachment(
+    content=str(Path("utils/README.md")),
+    mime_type="text/markdown",
+    name="Utils Documentation",
+    preview=Path("utils/README.md").read_text(),
+)
+
+prompt: Prompt = ["Recommend based on weather data.", docs_attachment]
+result = harness.run_single(prompt)
+```
+
+See: [examples/docs_from_file.py](examples/docs_from_file.py)
+
 ---
 
 ## RunResult Object
@@ -513,7 +722,8 @@ for entry in result.history:
 | `search_web` | Web search (if enabled) | Yes |
 | `search_files` | File read/search (if enabled) | Yes |
 | `execute_code` | Python REPL (if enabled) | No (sequential) |
-| `verify_answer` | Check against rubric | No |
+| `ask_user` | Request user clarification (if enabled) | Yes |
+| `verify_answer` | Check against rubric | No (blocks if questions pending) |
 | `submit_answer` | Submit final answer | Last |
 
 ---
@@ -603,6 +813,8 @@ if __name__ == "__main__":
 | `Attachment` | File attachment for multimodal prompts |
 | `CompactionConfig` | Context compaction settings |
 | `SubprocessExecutor` | Stateful Python code executor |
+| `RemoteExecutor` | Frontend-delegated code executor (SSE) |
+| `ModeConfig` | Custom mode configuration |
 | `RunResult` | Task execution result |
 | `HistoryEntry` | Single event in execution trace |
 
@@ -615,6 +827,7 @@ if __name__ == "__main__":
 | `harness.get_history_markdown()` | Get formatted trace |
 | `harness.list_modes()` | List available modes |
 | `harness.get_mode_config(name)` | Get mode configuration |
+| `harness.provider.receive_user_response(id, answers)` | Respond to ask_user questions |
 
 ---
 

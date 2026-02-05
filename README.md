@@ -14,7 +14,19 @@ Knowledge work is fundamentally different. **The solution space is vast and unde
 - **Iterative refinement**: Failed verification triggers targeted improvement
 - **Transparent evaluation**: Humans can audit the rubric and verification process
 
-This SDK implements a **self-verifying agentic loop** that brings structure to the inherently open-ended nature of knowledge work.
+This SDK implements a **self-verifying agentic loop** that brings structure to the inherently open-ended nature of knowledge work. The agent can search the web, read and write files, execute code, generate artifacts, and ask the user for clarification—all coordinated through an orchestrator that verifies its own output.
+
+## Why I'm Sharing This
+
+This started as a harness for running RL training on knowledge tasks. I'm open-sourcing it because:
+
+1. **Knowledge workflows are underexplored.** Most AI tooling focuses on code. But knowledge work—research, analysis, strategy, writing—is where most professionals spend their time. The primitives for building these systems aren't well established yet.
+
+2. **This could be a useful building block.** If you're building products that involve AI doing research, making recommendations, or producing documents, this verification loop might save you weeks of iteration.
+
+3. **Models still struggle with verification.** The self-check step is the weakest link. If this gets adoption, an open-source model provider could train specifically on rubric-based verification—improving the entire ecosystem.
+
+I'd rather see these ideas spread than keep them proprietary.
 
 ## The Verification Loop
 
@@ -255,6 +267,8 @@ harness = RLHarness(
 )
 ```
 
+See: [examples/standard_with_search.py](examples/standard_with_search.py)
+
 ### File System Access
 
 ```python
@@ -305,6 +319,40 @@ result = harness.run_single(prompt)
 
 See: [examples/with_files.py](examples/with_files.py)
 
+### User Clarification (ask_user)
+
+Enable interactive clarification when tasks are ambiguous:
+
+```python
+import threading
+from verif import RLHarness, ProviderConfig
+
+def on_event(entry, harness):
+    if entry.entry_type == "user_question":
+        question_id = entry.metadata["question_id"]
+        questions = entry.metadata["questions"]
+        
+        # Generate or collect answers
+        answers = {0: "B2B SaaS platform", 1: "$50,000 budget"}
+        
+        # Send response back (in a thread to not block)
+        threading.Thread(
+            target=lambda: harness.provider.receive_user_response(question_id, answers)
+        ).start()
+
+harness = RLHarness(
+    provider="gemini",
+    enable_ask_user=True,
+    on_event=lambda e: on_event(e, harness),
+)
+
+result = harness.run_single("Create a project plan for my product launch.")
+```
+
+The orchestrator can call `ask_user` to request clarification. Verification is blocked until all pending questions are answered.
+
+See: [tests/test_ask_user.py](tests/test_ask_user.py)
+
 ---
 
 ## Streaming Events
@@ -350,6 +398,7 @@ harness = RLHarness(
     enable_search=True,     # Web search tool
     enable_bash=False,      # File system navigation
     enable_code=False,      # Python code execution
+    enable_ask_user=False,  # User clarification tool
     
     # Code Execution (required if enable_code=True)
     code_executor=SubprocessExecutor("./artifacts"),
@@ -420,6 +469,7 @@ for entry in result.history:
 | `search_web` | Web search | `enable_search=True` |
 | `search_files` | File read/search | `enable_bash=True` |
 | `execute_code` | Python REPL | `enable_code=True` |
+| `ask_user` | Request user clarification | `enable_ask_user=True` |
 | `verify_answer` | Check against rubric | standard, plan, iterate |
 | `verify_exploration` | Check quality checklist | explore |
 | `submit_answer` | Submit final answer | All modes |
@@ -440,9 +490,6 @@ Save execution state at any step. Resume or re-execute from any checkpoint with 
 ### Step Replay
 Re-run from any intermediate step with different parameters or context, without re-executing prior steps.
 
-### Custom Provider Support
-Enable adding new model providers (Anthropic, OpenRouter, local models) via a clean `BaseProvider` interface. Currently supports Gemini and OpenAI.
-
 ---
 
 ## Examples
@@ -458,6 +505,13 @@ Enable adding new model providers (Anthropic, OpenRouter, local models) via a cl
 | [with_files.py](examples/with_files.py) | Multimodal prompts with attachments |
 | [with_streaming.py](examples/with_streaming.py) | Real-time event streaming |
 | [with_custom_executor.py](examples/with_custom_executor.py) | Custom sandboxed executor |
+| [custom_mode_bizarro.py](examples/custom_mode_bizarro.py) | Custom mode with inverted workflow ² |
+| [no_tools_needed.py](examples/no_tools_needed.py) | Pre-built utils + execute_code pattern ¹ |
+| [docs_from_file.py](examples/docs_from_file.py) | Docs as file attachment pattern ¹ |
+| [with_memory.py](examples/with_memory.py) | Memory/context file for complex decisions |
+
+> ¹ See [TOOL_CALLING_GUIDE.md](TOOL_CALLING_GUIDE.md) for the philosophy: skip MCP servers, use code as tools.
+> ² See [EXTENSIONS.md](EXTENSIONS.md) for creating custom modes and providers.
 
 ### Example Outputs
 
@@ -467,6 +521,43 @@ See [examples/outputs/](examples/outputs/) for sample execution results:
 |--------|-------------|
 | [standard_mode_output.md](examples/outputs/standard_mode_output.md) | Carbon tax vs cap-and-trade analysis with auto-generated rubric |
 | [iterate_workflow_output.md](examples/outputs/iterate_workflow_output.md) | Iteration example showing refinement based on feedback |
+| [bizarro_output.md](examples/outputs/bizarro_output.md) | Custom Bizarro mode output |
+| [no_tools_needed_output.md](examples/outputs/no_tools_needed_output.md) | Weather recommendation without custom tools |
+
+---
+
+## Additional Guides
+
+- [SDK_GUIDE.md](SDK_GUIDE.md) – Complete API reference and usage patterns
+- [TOOL_CALLING_GUIDE.md](TOOL_CALLING_GUIDE.md) – Opinionated approach: use code as tools instead of MCP servers
+- [EXTENSIONS.md](EXTENSIONS.md) – Extending the SDK with custom modes and providers
+
+---
+
+## Training Guidelines
+
+If you're using this for RL training:
+
+**Experiment relentlessly.** The reward signal for knowledge work is noisy. What works for one task type may fail for another.
+
+**Train selectively on the control plane.** In my experience, training works best when you focus on:
+- Orchestrator outputs (tool calls, sequencing decisions)
+- Brief creation (task formalization)
+- Rubric creation (evaluation criteria)
+
+Leave out subagent outputs, search results, and code execution from the training signal—even if they're generated by the same policy. The goal is to improve the *orchestration* and *verification* layers. Everything else is downstream; if the orchestrator gets better at decomposition and the rubric gets better at capturing intent, the subagents benefit automatically.
+
+**Verification is the bottleneck.** Most training gains come from improving the verify step. A model that can accurately assess its own work against a rubric is more valuable than one that generates slightly better first drafts.
+
+---
+
+## Limitations
+
+**Verification is only as good as the model.** The rubric is generated by the same model that does the work. If the model has blind spots, the rubric will too. This is a fundamental constraint of self-verification.
+
+**External grounding happens at brief level, not verification.** If you need external validation (e.g., checking facts against a database), you can provide your own rubric. But be careful: the verifier is intentionally limited—it doesn't have access to search or filesystem. The design assumes grounding happens during task execution (via the brief and subagents), not during verification. The verifier checks *internal consistency* against the rubric, not *external correctness*.
+
+**Rubrics can be gamed.** A sufficiently clever model could write a rubric that's easy to pass. This is why human review of rubrics matters for high-stakes tasks.
 
 ---
 
