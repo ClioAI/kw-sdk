@@ -2,6 +2,7 @@ import time
 import logging
 import subprocess
 import re
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..prompts import (
     BRIEF_CREATOR, RUBRIC_CREATOR, VERIFICATION, FILE_SEARCH_AGENT, COMPACTION_SUMMARIZER,
     EXPLORE_ORCHESTRATOR, EXPLORE_BRIEF, EXPLORE_VERIFIER, ORCHESTRATOR, ORCHESTRATOR_WITH_PLAN,
-    ITERATE_ORCHESTRATOR
+    ITERATE_ORCHESTRATOR, ASK_USER_ADDENDUM
 )
 from ..config import Prompt, Attachment, CompactionConfig, ModeConfig
 from ..modes import get_mode, get_tools_for_mode
@@ -244,6 +245,36 @@ TOOL_DEFINITIONS = {
             "required": ["takes"],
         },
     },
+    "ask_user": {
+        "name": "ask_user",
+        "description": "Ask user for clarification or intermediate feedback. Use when you need user input to proceed. Can run in parallel with other tools. IMPORTANT: Cannot proceed to verification while questions are pending.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "The question to ask."},
+                            "options": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional list of choices for the user to pick from."
+                            },
+                        },
+                        "required": ["question"],
+                    },
+                    "description": "List of questions to ask the user."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Context about why you're asking and what you've done so far."
+                },
+            },
+            "required": ["questions"],
+        },
+    },
 }
 
 
@@ -291,6 +322,11 @@ class BaseProvider(ABC):
         self._subagent_counter: int = 0
         # Mode tracking
         self.mode: str = "standard"  # "standard" | "plan" | "explore"
+        # User question tracking
+        self._user_responses: dict[str, dict] = {}  # question_id -> response dict
+        self._user_response_events: dict[str, threading.Event] = {}
+        self._pending_user_questions: set[str] = set()
+        self._user_clarifications: list[dict] = []  # [{question_id, questions, response, timestamp}]
 
     def _next_subagent_id(self) -> str:
         """Generate unique ID for subagent tracking."""
@@ -325,6 +361,10 @@ class BaseProvider(ABC):
         self.brief = None
         self.submitted_answer = None
         self._brief_created = False
+        self._user_responses = {}
+        self._user_response_events = {}
+        self._pending_user_questions = set()
+        self._user_clarifications = []
 
     def get_history_text(self) -> str:
         lines = []
@@ -384,10 +424,21 @@ class BaseProvider(ABC):
             return self.search(args.get("query", ""), stream=self.stream_subagents, subagent_id=subagent_id)
 
         elif name == "verify_answer":
+            # Block if user questions are pending
+            if self._pending_user_questions:
+                pending = ", ".join(self._pending_user_questions)
+                return f"ERROR: Cannot verify - awaiting user response to pending questions: {pending}. Wait for ask_user responses first."
             answer = args.get("answer", "")
             if not self.rubric:
                 return "ERROR: No rubric created. Call create_rubric first."
             verification_prompt = f"## Rubric\n{self.rubric}\n\n## Answer\n{answer}"
+            # Include user clarifications if any
+            if self._user_clarifications:
+                clarifications_text = "\n".join(
+                    f"- Q: {c['questions']} → A: {c['response']}"
+                    for c in self._user_clarifications
+                )
+                verification_prompt += f"\n\n## User Clarifications\nThe user provided these clarifications during execution. Rubric may be stale around these points - verify intent based on clarifications, not just literal rubric criteria:\n{clarifications_text}"
             return self.generate(verification_prompt, system=VERIFICATION, _log=False)
 
         elif name == "submit_answer":
@@ -425,11 +476,20 @@ class BaseProvider(ABC):
             return self.search_files(query, path)
 
         elif name == "verify_exploration":
+            # Block if user questions are pending
+            if self._pending_user_questions:
+                pending = ", ".join(self._pending_user_questions)
+                return f"ERROR: Cannot verify - awaiting user response to pending questions: {pending}. Wait for ask_user responses first."
             takes = args.get("takes", "")
             # Use custom rubric if provided, else use default EXPLORE_VERIFIER
             verifier_prompt = self.rubric if self.rubric else EXPLORE_VERIFIER
             verification_prompt = f"## Exploration Output\n{takes}"
             return self.generate(verification_prompt, system=verifier_prompt, _log=False)
+
+        elif name == "ask_user":
+            questions = args.get("questions", [])
+            context = args.get("context", "")
+            return self._ask_user(questions, context)
 
         return f"Unknown tool: {name}"
 
@@ -488,6 +548,61 @@ class BaseProvider(ABC):
             return "Error: Command timed out after 30 seconds."
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    def _ask_user(self, questions: list[dict], context: str, timeout: float = 300) -> str:
+        """Ask user for clarification. Emits event and blocks waiting for response."""
+        question_id = f"q_{int(time.time() * 1000)}"
+
+        # Format questions for display
+        questions_text = "\n".join(
+            f"{i+1}. {q['question']}" + (f" (options: {', '.join(q['options'])})" if q.get('options') else "")
+            for i, q in enumerate(questions)
+        )
+
+        # Track as pending
+        self._pending_user_questions.add(question_id)
+
+        # Create wait event
+        event = threading.Event()
+        self._user_response_events[question_id] = event
+
+        # Emit the question event
+        self.emit("user_question", questions_text, {
+            "question_id": question_id,
+            "questions": questions,
+            "context": context,
+        })
+
+        # Wait for response
+        if event.wait(timeout=timeout):
+            response = self._user_responses.pop(question_id, {})
+            self._user_response_events.pop(question_id, None)
+            self._pending_user_questions.discard(question_id)
+
+            # Store clarification for verification context
+            self._user_clarifications.append({
+                "question_id": question_id,
+                "questions": questions_text,
+                "response": response,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+            # Format response for model
+            if isinstance(response, dict):
+                return "\n".join(f"Q{k}: {v}" for k, v in response.items())
+            return str(response)
+        else:
+            self._user_response_events.pop(question_id, None)
+            self._pending_user_questions.discard(question_id)
+            return f"User response timeout after {timeout}s - no answer received."
+
+    def receive_user_response(self, question_id: str, response: dict) -> bool:
+        """Receive a response to a user question. Returns True if question was pending."""
+        if question_id not in self._user_response_events:
+            return False
+        self._user_responses[question_id] = response
+        self._user_response_events[question_id].set()
+        return True
 
     def _execute_tools_parallel(self, func_calls: list[FunctionCall], step_desc: str) -> tuple[list[str], set[int]]:
         """Execute tools in parallel, return results and error indices."""
@@ -636,6 +751,7 @@ class BaseProvider(ABC):
         enable_search: bool = False,
         enable_bash: bool = False,
         enable_code: bool = False,
+        enable_ask_user: bool = False,
         max_iterations: int = 30,
         stream: bool = False,
         stream_subagents: bool = False,
@@ -643,13 +759,14 @@ class BaseProvider(ABC):
         **mode_kwargs,
     ) -> str:
         """Unified orchestrator that reads all behavior from ModeConfig.
-        
+
         Args:
             task: The task prompt
             mode: ModeConfig defining orchestrator behavior
             enable_search: Enable search_web tool
-            enable_bash: Enable search_files tool  
+            enable_bash: Enable search_files tool
             enable_code: Enable execute_code tool
+            enable_ask_user: Enable ask_user tool
             max_iterations: Max orchestrator iterations
             stream: Enable streaming for main orchestrator
             stream_subagents: Enable streaming for subagents
@@ -669,7 +786,7 @@ class BaseProvider(ABC):
         self.stream_subagents = stream_subagents
 
         # Get tools for this mode
-        tool_names = get_tools_for_mode(mode, enable_search, enable_bash, enable_code)
+        tool_names = get_tools_for_mode(mode, enable_search, enable_bash, enable_code, enable_ask_user)
 
         # Get orchestrator prompt
         system = PROMPTS[mode.orchestrator_prompt]
@@ -690,6 +807,16 @@ class BaseProvider(ABC):
                     f"## TARGET TAKES\nGenerate approximately {num_takes} takes.\n\n## MINIMUM TAKES"
                 )
 
+        # Inject sandbox context if using RemoteExecutor
+        if enable_code and self.code_executor and hasattr(self.code_executor, "get_sandbox_context"):
+            sandbox_ctx = self.code_executor.get_sandbox_context()
+            if sandbox_ctx:
+                system += f"\n\n## CODE EXECUTION ENVIRONMENT\n{sandbox_ctx}\nWrite code compatible with this environment."
+
+        # Inject ask_user addendum if enabled
+        if enable_ask_user:
+            system += ASK_USER_ADDENDUM
+
         task_text = _prompt_to_log(task)
         self.log("user", task_text)
         self.log("system", f"[{mode.name.title()} Mode] {system[:200]}...")
@@ -704,6 +831,7 @@ class BaseProvider(ABC):
         enable_search: bool = False,
         enable_bash: bool = False,
         enable_code: bool = False,
+        enable_ask_user: bool = False,
         max_iterations: int = 30,
         stream: bool = False,
         stream_subagents: bool = False,
@@ -715,6 +843,7 @@ class BaseProvider(ABC):
             enable_search=enable_search,
             enable_bash=enable_bash,
             enable_code=enable_code,
+            enable_ask_user=enable_ask_user,
             max_iterations=max_iterations,
             stream=stream,
             stream_subagents=stream_subagents,
@@ -728,6 +857,7 @@ class BaseProvider(ABC):
         enable_search: bool = False,
         enable_bash: bool = False,
         enable_code: bool = False,
+        enable_ask_user: bool = False,
         max_iterations: int = 30,
         stream: bool = False,
         stream_subagents: bool = False,
@@ -739,6 +869,7 @@ class BaseProvider(ABC):
             enable_search=enable_search,
             enable_bash=enable_bash,
             enable_code=enable_code,
+            enable_ask_user=enable_ask_user,
             max_iterations=max_iterations,
             stream=stream,
             stream_subagents=stream_subagents,
@@ -752,6 +883,7 @@ class BaseProvider(ABC):
         enable_search: bool = False,
         enable_bash: bool = False,
         enable_code: bool = False,
+        enable_ask_user: bool = False,
         max_iterations: int = 30,
         stream: bool = False,
         stream_subagents: bool = False,
@@ -763,6 +895,7 @@ class BaseProvider(ABC):
             enable_search=enable_search,
             enable_bash=enable_bash,
             enable_code=enable_code,
+            enable_ask_user=enable_ask_user,
             max_iterations=max_iterations,
             stream=stream,
             stream_subagents=stream_subagents,

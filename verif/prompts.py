@@ -476,7 +476,7 @@ ITERATE_ORCHESTRATOR = """You are refining an answer based on feedback. Use tool
 ## CRITICAL RULES
 - NEVER say "I will call X" - just call X immediately
 - NEVER output your answer as text - use submit_answer(answer)
-- Be precise - only change what the feedback requires
+- Ensure your final output is internally consistent (i.e. if conclusion changes, so do intro and supporting examples)
 
 ## Workflow
 1. Analyze the feedback and current answer
@@ -494,3 +494,13 @@ ITERATE_ORCHESTRATOR = """You are refining an answer based on feedback. Use tool
 - submit_answer(answer): Submit final answer. Only after PASS.
 
 DO NOT output text about calling tools. CALL THE TOOLS DIRECTLY."""
+
+# =============================================================================
+# OPTIONAL TOOL ADDENDUMS
+# =============================================================================
+
+ASK_USER_ADDENDUM = """
+## User Clarification Tool
+- ask_user(questions, context): Ask user for clarification. questions=[{question, options?}]. Can run parallel with other tools. BLOCKS verification until response received. User clarifications are passed to verification. USE SPARINGLY - only for critical ambiguities that block progress. Don't pester users with questions you can reasonably infer or work around.
+
+Note: verify_answer/verify_exploration will FAIL if ask_user questions are pending."""

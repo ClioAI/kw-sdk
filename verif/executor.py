@@ -3,8 +3,11 @@ import sys
 import subprocess
 import tempfile
 import json
+import asyncio
+import uuid
+import time
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, Callable, Any
 from pathlib import Path
 
 
@@ -129,3 +132,99 @@ while True:
     def __del__(self):
         if self._proc:
             self._proc.terminate()
+
+
+class RemoteExecutor:
+    """Executor that delegates to frontend via SSE/HTTP callback."""
+
+    def __init__(
+        self,
+        session_id: str,
+        emit_event: Callable[[str, dict], None],
+        timeout: int = 30,
+        sandbox_config: dict | None = None,
+    ):
+        self.session_id = session_id
+        self.emit_event = emit_event
+        self.timeout = timeout
+        self.sandbox_config = sandbox_config or {}
+        self.pending: dict[str, asyncio.Event] = {}
+        self.results: dict[str, dict] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+
+    def execute(self, code: str) -> CodeResult:
+        """Execute code by delegating to frontend. Blocks until response."""
+        request_id = str(uuid.uuid4())
+
+        if self._loop and self._loop.is_running():
+            # Create event in the event loop's context
+            future = asyncio.run_coroutine_threadsafe(
+                self._execute_async(request_id, code), self._loop
+            )
+            try:
+                return future.result(timeout=self.timeout + 5)
+            except Exception as e:
+                return CodeResult(stdout="", stderr="", error=f"Remote execution failed: {e}")
+        else:
+            return CodeResult(stdout="", stderr="", error="No event loop available")
+
+    async def _execute_async(self, request_id: str, code: str) -> CodeResult:
+        event = asyncio.Event()
+        self.pending[request_id] = event
+
+        event_data = {
+            "request_id": request_id,
+            "session_id": self.session_id,
+            "tool": "execute_code",
+            "args": {"code": code},
+            "timeout_ms": self.timeout * 1000,
+        }
+        if self.sandbox_config:
+            event_data["sandbox"] = self.sandbox_config
+        self.emit_event("tool_request", event_data)
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=self.timeout)
+            result = self.results.pop(request_id, {})
+            if result.get("success"):
+                data = result.get("data", {})
+                return CodeResult(
+                    stdout=data.get("stdout", ""),
+                    stderr=data.get("stderr", ""),
+                    artifacts=data.get("artifacts", []),
+                    error=None,
+                )
+            else:
+                return CodeResult(stdout="", stderr="", error=result.get("error", "Unknown error"))
+        except asyncio.TimeoutError:
+            self.pending.pop(request_id, None)
+            return CodeResult(stdout="", stderr="", error=f"Tool timed out after {self.timeout}s")
+
+    def receive_response(self, request_id: str, result: dict):
+        """Called by /tool/respond endpoint."""
+        if request_id in self.pending:
+            self.results[request_id] = result
+            self.pending[request_id].set()
+
+    def get_pending_requests(self) -> list[dict]:
+        return [{"request_id": rid, "tool": "execute_code"} for rid in self.pending]
+
+    def get_sandbox_context(self) -> str | None:
+        """Return sandbox description for orchestrator prompt."""
+        if not self.sandbox_config:
+            return None
+        lines = []
+        if t := self.sandbox_config.get("type"):
+            lines.append(f"- Runtime: {t}")
+        if pkgs := self.sandbox_config.get("packages"):
+            lines.append(f"- Available packages: {', '.join(pkgs)}")
+        if constraints := self.sandbox_config.get("constraints"):
+            lines.append(f"- Constraints: {constraints}")
+        return "\n".join(lines) if lines else None
+
+    def reset(self):
+        self.pending.clear()
+        self.results.clear()

@@ -89,27 +89,29 @@ def get_tools_for_mode(
     enable_search: bool = False,
     enable_bash: bool = False,
     enable_code: bool = False,
+    enable_ask_user: bool = False,
 ) -> list[str]:
     """Get the full tool list for a mode with optional capabilities.
-    
+
     Args:
         mode: The mode configuration
         enable_search: Whether to include search_web tool
         enable_bash: Whether to include search_files tool
         enable_code: Whether to include execute_code tool
-        
+        enable_ask_user: Whether to include ask_user tool
+
     Returns:
         List of tool names in the order they should appear
     """
     tools = mode.tools.copy()
-    
+
     # Find insertion point (before verification tool)
     verification_idx = len(tools)
     for i, tool in enumerate(tools):
         if tool in ("verify_answer", "verify_exploration"):
             verification_idx = i
             break
-    
+
     # Insert optional tools before verification
     optional_tools = []
     if enable_search:
@@ -118,8 +120,10 @@ def get_tools_for_mode(
         optional_tools.append("search_files")
     if enable_code:
         optional_tools.append("execute_code")
-    
+    if enable_ask_user:
+        optional_tools.append("ask_user")
+
     for i, tool in enumerate(optional_tools):
         tools.insert(verification_idx + i, tool)
-    
+
     return tools

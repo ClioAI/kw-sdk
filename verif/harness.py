@@ -64,6 +64,7 @@ class RLHarness:
         enable_search: bool = False,
         enable_bash: bool = False,
         enable_code: bool = False,
+        enable_ask_user: bool = False,
         code_executor: CodeExecutor | None = None,
         artifacts_dir: str = "./artifacts",
         max_iterations: int = 30,
@@ -75,12 +76,13 @@ class RLHarness:
         stream_subagents: bool = False,
     ):
         """Initialize harness.
-        
+
         Args:
             provider: Provider name or config
             enable_search: Enable web search tool
-            enable_bash: Enable bash/file tools  
+            enable_bash: Enable bash/file tools
             enable_code: Enable code execution
+            enable_ask_user: Enable ask_user tool
             code_executor: Code executor instance (required if enable_code=True)
             artifacts_dir: Directory for artifacts
             max_iterations: Max orchestrator iterations
@@ -96,6 +98,7 @@ class RLHarness:
         self.enable_search = enable_search
         self.enable_bash = enable_bash
         self.enable_code = enable_code
+        self.enable_ask_user = enable_ask_user
         self.artifacts_dir = artifacts_dir
         self.max_iterations = max_iterations
         self.default_mode = default_mode
@@ -183,6 +186,7 @@ class RLHarness:
                 enable_search=self.enable_search,
                 enable_bash=self.enable_bash,
                 enable_code=self.enable_code,
+                enable_ask_user=self.enable_ask_user,
                 max_iterations=self.max_iterations,
                 stream=self.stream,
                 stream_subagents=self.stream_subagents,
@@ -262,6 +266,7 @@ class RLHarness:
             enable_search=self.enable_search,
             enable_bash=self.enable_bash,
             enable_code=self.enable_code,
+            enable_ask_user=self.enable_ask_user,
             max_iterations=self.max_iterations,
             stream=self.stream,
             stream_subagents=self.stream_subagents,
