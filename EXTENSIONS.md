@@ -438,36 +438,70 @@ result = harness.run_single(
 
 ---
 
-## Tool Definitions
+## Adding Custom Capabilities
 
-Tools are defined in `verif/providers/base.py` in `TOOL_DEFINITIONS`. To add a new tool:
+**You don't need to define custom tools.** The SDK provides `execute_code`—use it to call your own Python functions.
 
-1. Add the definition to `TOOL_DEFINITIONS`:
+Instead of building tool infrastructure, write tested utility functions and let the model call them via code execution. This is simpler, more testable, and doesn't require modifying the SDK.
 
-```python
-TOOL_DEFINITIONS = {
-    # ... existing tools
-    "my_tool": {
-        "name": "my_tool",
-        "description": "Does something useful",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "param1": {"type": "string", "description": "First param"},
-            },
-            "required": ["param1"],
-        },
-    },
-}
-```
-
-2. Handle the tool call in `_execute_tool()` in `BaseProvider`:
+### Pattern: Utilities + Documentation
 
 ```python
-def _execute_tool(self, name: str, args: dict, ...) -> str:
-    if name == "my_tool":
-        return self._handle_my_tool(args["param1"])
-    # ... existing handlers
+# 1. Write your utility (utils/crm.py)
+def get_customer(customer_id: str) -> dict:
+    """Fetch customer from CRM."""
+    response = requests.get(f"{CRM_API}/customers/{customer_id}")
+    return response.json()
+
+def update_customer(customer_id: str, data: dict) -> dict:
+    """Update customer record."""
+    response = requests.patch(f"{CRM_API}/customers/{customer_id}", json=data)
+    return response.json()
 ```
 
-3. Include it in your mode's `tools` list.
+```python
+# 2. Document it for the model
+CRM_DOCS = """
+## Available: CRM Utilities
+
+```python
+from utils.crm import get_customer, update_customer
+
+get_customer("cust_123")
+# Returns: {"id": "cust_123", "name": "Acme Corp", "tier": "enterprise"}
+
+update_customer("cust_123", {"tier": "premium"})
+# Returns: {"id": "cust_123", "name": "Acme Corp", "tier": "premium"}
+```
+"""
+```
+
+```python
+# 3. Include docs in task
+harness = RLHarness(provider="gemini", enable_code=True)
+
+result = harness.run_single(f"""
+Update customer cust_456 to premium tier and verify the change.
+
+{CRM_DOCS}
+""")
+```
+
+The model imports your functions and calls them. No tool registration needed.
+
+### Why This Works Better
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Custom tool definition | Native to model | Requires SDK modification, hard to test |
+| **Utilities + execute_code** | Testable, reusable, no SDK changes | Slightly more tokens for docs |
+
+### When You Actually Need Custom Tools
+
+If you're forking the SDK and need deeply integrated tools (e.g., a new verification method), see the source in `verif/providers/base.py`:
+- `TOOL_DEFINITIONS`: JSON schemas for tools
+- `_execute_tool()`: Handler dispatch
+
+But for most use cases, `execute_code` + documented utilities is the right pattern.
+
+See [TOOL_CALLING_GUIDE.md](TOOL_CALLING_GUIDE.md) for the full philosophy and examples.
