@@ -1,0 +1,4 @@
+vendor,part_price_top,part_price_base,tooling,rd,lead_time_weeks,fx_exposure
+autolantic,7286.0,3985.0,40000000.0,7000000.0,12,high
+vendocrat,5834.0,3257.0,10000000.0,2000000.0,6,low
+solimoto,6347/6150,3550/3350,30000000.0,4500000.0,6,low-medium
