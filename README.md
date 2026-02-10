@@ -88,6 +88,7 @@ Create a `.env` file:
 ```bash
 GEMINI_API_KEY=your_gemini_key
 OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
 ```
 
 ## Quick Start
@@ -95,7 +96,7 @@ OPENAI_API_KEY=your_openai_key
 ```python
 from verif import RLHarness
 
-harness = RLHarness(provider="gemini")
+harness = RLHarness(provider="gemini")  # or "openai" or "anthropic"
 result = harness.run_single("Analyze the economic impact of remote work on urban real estate.")
 
 print(result.answer)  # The analysis
@@ -114,6 +115,14 @@ The SDK provides different modes optimized for different types of knowledge work
 | **`plan`** | Complex multi-step tasks | User-provided or auto-created |
 | **`explore`** | Creative/divergent thinking | Quality checklist (no accuracy rubric) |
 | **`iterate`** | Refining existing work | Uses existing rubric + feedback |
+
+### Supported Providers
+
+| Provider | Config | Thinking Control |
+|----------|--------|-----------------|
+| **Gemini** | `provider="gemini"` | `thinking_level`: `LOW` / `MEDIUM` / `HIGH` |
+| **OpenAI** | `provider="openai"` | `reasoning_effort`: `low` / `medium` / `high` |
+| **Anthropic** | `provider="anthropic"` | `thinking_budget`: token count (default 10000) |
 
 ### Standard Mode (Default)
 
@@ -234,6 +243,35 @@ print(iterate_result.answer)  # Refined version
 ```
 
 See: [examples/iterate_workflow.py](examples/iterate_workflow.py)
+
+### Checkpointing & Resume
+
+Save execution state at every step. Resume from any checkpoint with optional feedback and rubric updates.
+
+```python
+from verif import RLHarness
+
+harness = RLHarness(provider="gemini", enable_search=True)
+
+# Run with checkpointing
+result = harness.run_single(
+    "Analyze the power dynamics among Olympian gods.",
+    checkpoint=True,
+)
+
+# List checkpoints
+for snap_id, snap in harness.snapshots.items():
+    print(f"{snap_id} (step {snap.step})")
+
+# Resume from any checkpoint with new direction
+resumed = harness.resume(
+    checkpoint_id="<snap_id>",
+    feedback="Focus more on the Trojan War.",
+    rubric_update="Must include analysis of divine intervention in the Iliad.",
+)
+```
+
+See: [tests/test_checkpoint.py](tests/test_checkpoint.py)
 
 ---
 
@@ -394,13 +432,16 @@ from verif import RLHarness, ProviderConfig, CompactionConfig
 from verif.executor import SubprocessExecutor
 
 harness = RLHarness(
-    # Provider: "gemini" | "openai" | ProviderConfig
+    # Provider: "gemini" | "openai" | "anthropic" | ProviderConfig
     provider=ProviderConfig(
         name="gemini",
         thinking_level="MEDIUM",  # Gemini: LOW | MEDIUM | HIGH
         # OR for OpenAI:
         # name="openai",
         # reasoning_effort="medium",  # low | medium | high
+        # OR for Anthropic:
+        # name="anthropic",
+        # thinking_budget=10000,  # token budget for extended thinking
     ),
     
     # Tool Capabilities
@@ -485,19 +526,36 @@ for entry in result.history:
 
 ---
 
-## Pending Work / Roadmap
+## TODO
 
-### Computer Use Subagent
-Attach a computer-use capable subagent for tasks requiring GUI interaction—filling forms, navigating apps, extracting data from web interfaces.
+<!-- Keep this up to date. Check items off as they land. -->
 
-### Multi-App Support
-Enable working across different applications (browsers, spreadsheets, documents) in a single workflow.
+### Done
 
-### State Checkpointing
-Save execution state at any step. Resume or re-execute from any checkpoint with modifications—"what if I changed step 3?"
+- [x] **State checkpointing & resume** — Save at every step, fork from any checkpoint with feedback + rubric updates. See [Checkpointing & Resume](#checkpointing--resume).
+- [x] **Anthropic provider** — Claude with streaming, extended thinking, native web search.
+- [x] **Context compaction** — Summarize middle of context when approaching token limits.
+- [x] **Explore mode** — Generate N distinct approaches with assumptions, counterfactuals, and set-level gaps.
+- [x] **Iterate mode** — Stateless refinement with feedback classification (rubric vs answer level).
+- [x] **Custom modes** — Register new execution modes at runtime.
+- [x] **Remote executor** — Delegate code execution to frontend/browser via SSE.
+- [x] **ask_user tool** — Orchestrator can request clarification; verification blocks until answered.
 
-### Step Replay
-Re-run from any intermediate step with different parameters or context, without re-executing prior steps.
+### In Progress
+
+- [ ] **Anthropic checkpointing** — Checkpointing works for Gemini and OpenAI. Anthropic not fully tested — the complexity is interleaved thinking blocks (thinking + signature pairs) that need to survive deep-copy and context replay correctly.
+- [ ] **Compaction for Anthropic** — SDK does its own compaction (summarize middle, keep recent turns) rather than using server-side context caching. Not stress-tested with Anthropic's 200K window.
+
+### Planned
+
+- [ ] **Computer use subagent** — Attach a computer-use capable subagent for GUI interaction (filling forms, navigating apps, extracting data from web interfaces).
+- [ ] **Multi-app workflows** — Working across browsers, spreadsheets, and documents in a single run.
+- [ ] **Parallel verification** — Run multiple verification passes and take consensus, reducing single-verifier bias.
+- [ ] **Rubric quality scoring** — Meta-evaluation: score the rubric itself before using it for verification. Catch "always-pass" rubrics early.
+- [ ] **Structured output from runs** — Return typed sections (executive summary, recommendations, evidence) instead of a single answer string.
+- [ ] **Eval framework** — Systematic comparison across providers/modes/rubric strategies on a benchmark task set. `run_eval` exists but needs scoring and reporting.
+- [ ] **Token usage tracking** — Surface per-run token counts by phase (brief, rubric, execution, verification) for cost analysis.
+- [ ] **Mixed-model orchestration** — Use different models for orchestrator vs subagents (e.g., Opus for orchestration, Flash for search subagents). Currently the same provider handles both. I kept it this way because RL training benefits from a single policy, but for production use the cost savings of routing cheap tasks to smaller models would be significant.
 
 ---
 
@@ -518,6 +576,10 @@ Re-run from any intermediate step with different parameters or context, without 
 | [no_tools_needed.py](examples/no_tools_needed.py) | Pre-built utils + execute_code pattern ¹ |
 | [docs_from_file.py](examples/docs_from_file.py) | Docs as file attachment pattern ¹ |
 | [with_memory.py](examples/with_memory.py) | Memory/context file for complex decisions |
+| [with_file_artifact.py](examples/with_file_artifact.py) | Model saves CSV artifacts, script converts to .xlsx |
+| [csv_research_and_calc.py](examples/csv_research_and_calc.py) | Research missing CSV fields + compute derived metrics |
+| [plan_mode_writing_workflow.py](examples/plan_mode_writing_workflow.py) | Plan as repeatable writing playbook with streaming |
+| [with_checkpointing.py](examples/with_checkpointing.py) | Checkpoint mid-run, fork with feedback + rubric update |
 
 > ¹ See [TOOL_CALLING_GUIDE.md](TOOL_CALLING_GUIDE.md) for the philosophy: skip MCP servers, use code as tools.
 > ² See [EXTENSIONS.md](EXTENSIONS.md) for creating custom modes and providers.
@@ -532,6 +594,9 @@ See [examples/outputs/](examples/outputs/) for sample execution results:
 | [iterate_workflow_output.md](examples/outputs/iterate_workflow_output.md) | Iteration example showing refinement based on feedback |
 | [bizarro_output.md](examples/outputs/bizarro_output.md) | Custom Bizarro mode output |
 | [no_tools_needed_output.md](examples/outputs/no_tools_needed_output.md) | Weather recommendation without custom tools |
+| [file_artifact_output.md](examples/outputs/file_artifact_output.md) | CSV artifacts with verify-iterate and .xlsx conversion |
+| [saas_benchmark_output.md](examples/outputs/saas_benchmark_output.md) | Research + calculation on sparse CSV data |
+| [plan_mode_writing_workflow_output.md](examples/outputs/plan_mode_writing_workflow_output.md) | Writing workflow with auto-generated rubric |
 
 ---
 
@@ -567,6 +632,8 @@ Leave out subagent outputs, search results, and code execution from the training
 **External grounding happens at brief level, not verification.** If you need external validation (e.g., checking facts against a database), you can provide your own rubric. But be careful: the verifier is intentionally limited—it doesn't have access to search or filesystem. The design assumes grounding happens during task execution (via the brief and subagents), not during verification. The verifier checks *internal consistency* against the rubric, not *external correctness*.
 
 **Rubrics can be gamed.** A sufficiently clever model could write a rubric that's easy to pass. This is why human review of rubrics matters for high-stakes tasks.
+
+**Context compaction requires a Gemini API key.** Compaction (summarizing mid-context to stay under token limits) uses `gemini-3-flash-preview` regardless of your chosen provider. If you enable compaction with OpenAI or Anthropic as the orchestrator, you'll still need a `GEMINI_API_KEY`. Free keys are available from [Google AI Studio](https://aistudio.google.com/).
 
 ---
 

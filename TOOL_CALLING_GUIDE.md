@@ -376,6 +376,29 @@ print(result.answer)
 
 ---
 
+## Relationship to Programmatic Tool Calling
+
+Anthropic introduced [Programmatic Tool Calling (PTC)](https://www.anthropic.com/engineering/advanced-tool-use) — where the model writes code that orchestrates multiple tool calls, and intermediate results flow through the executing script rather than back into the model's context window. This reduces token consumption (~37% in their benchmarks) by keeping intermediate data out of context.
+
+PTC and what we describe here solve adjacent problems:
+
+| | This guide | PTC |
+|--|-----------|-----|
+| **Question answered** | What should you build? | Where should results flow? |
+| **Insight** | Functions, not tool servers | Through code, not through context |
+| **Developer effort** | Write functions + docs | Use Anthropic's beta API header |
+
+They're complementary. You can write utility functions as described here and have them called via PTC so intermediate results stay in the sandbox.
+
+In practice, our SDK already supports both sides of this:
+
+- **Model as caller**: Give it documented functions, it imports and calls them — [no_tools_needed.py](examples/no_tools_needed.py), [docs_from_file.py](examples/docs_from_file.py)
+- **Model as writer**: Give it a pre-loaded environment or raw data, it writes the orchestration code — [with_custom_executor.py](examples/with_custom_executor.py), [csv_research_and_calc.py](examples/csv_research_and_calc.py)
+
+The second pattern is essentially what PTC formalizes: the model writes code that calls tools and processes results before returning to context. We just do it through `execute_code` with a stateful REPL rather than a special API mode.
+
+---
+
 ## Summary
 
 | Approach | Lines of code | Maintenance | Testability |

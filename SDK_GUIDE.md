@@ -24,6 +24,7 @@ Create a `.env` file with your API keys:
 ```bash
 GEMINI_API_KEY=your_gemini_key
 OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
 ```
 
 ---
@@ -57,6 +58,20 @@ result = harness.run_single("Explain quantum entanglement in simple terms.")
 print(result.answer)
 ```
 
+### With Anthropic
+
+```python
+from verif import RLHarness, ProviderConfig
+
+config = ProviderConfig(name="anthropic")
+harness = RLHarness(provider=config, enable_search=True)
+
+result = harness.run_single("Compare the GDP of Japan and Germany in 2024.")
+print(result.answer)
+```
+
+Anthropic uses Claude's native web search tool and extended thinking (budget defaults to 10,000 tokens).
+
 ---
 
 ## Core Concepts
@@ -89,13 +104,16 @@ from verif import RLHarness, ProviderConfig, CompactionConfig
 from verif.executor import SubprocessExecutor
 
 harness = RLHarness(
-    # Provider: "gemini" | "openai" | ProviderConfig
+    # Provider: "gemini" | "openai" | "anthropic" | ProviderConfig
     provider=ProviderConfig(
         name="gemini",
         thinking_level="MEDIUM",  # Gemini: LOW | MEDIUM | HIGH
         # OR for OpenAI:
         # name="openai",
         # reasoning_effort="medium",  # low | medium | high
+        # OR for Anthropic:
+        # name="anthropic",
+        # thinking_budget=10000,  # extended thinking token budget
     ),
     
     # Tool Capabilities
@@ -544,6 +562,63 @@ for r in results:
 
 ---
 
+## Checkpointing & Resume
+
+Save execution state at every orchestrator step. Resume from any checkpoint with optional feedback and rubric updates.
+
+```python
+from verif import RLHarness, ProviderConfig
+
+harness = RLHarness(provider="gemini", enable_search=True)
+
+# Enable checkpointing
+result = harness.run_single(
+    "Analyze the power dynamics among Olympian gods.",
+    checkpoint=True,
+)
+
+# Inspect checkpoints (keyed by "{run_id}:step:{N}")
+for snap_id, snap in harness.snapshots.items():
+    print(f"{snap_id} — step {snap.step}, rubric={'yes' if snap.state.get('rubric') else 'no'}")
+```
+
+### Resume with Feedback
+
+```python
+# Fork from a checkpoint with new direction
+resumed = harness.resume(
+    checkpoint_id="abc123:step:5",
+    feedback="Focus more on the Trojan War rivalries.",
+)
+```
+
+### Resume with Rubric Update
+
+```python
+# Merge new criteria into the existing rubric at the checkpoint
+resumed = harness.resume(
+    checkpoint_id="abc123:step:8",
+    rubric_update="Must include analysis of divine intervention in the Iliad.",
+)
+```
+
+### Snapshot Object
+
+```python
+from verif.config import Snapshot
+
+# Fields:
+snap.id              # "{run_id}:step:{step}"
+snap.step            # Iteration number
+snap.context         # Deep copy of provider-native context
+snap.state           # {"rubric", "brief", "submitted_answer", "_brief_created", "mode"}
+snap.history_index   # Index into history[] at this point
+snap.tool_names      # Tools available at this step
+snap.system          # System prompt
+```
+
+---
+
 ## Advanced Configuration
 
 ### Context Compaction
@@ -579,6 +654,12 @@ gemini_config = ProviderConfig(
 openai_config = ProviderConfig(
     name="openai",
     reasoning_effort="high",  # low | medium | high
+)
+
+# Anthropic with extended thinking
+anthropic_config = ProviderConfig(
+    name="anthropic",
+    # thinking_budget defaults to 10000 tokens
 )
 ```
 
@@ -817,6 +898,7 @@ if __name__ == "__main__":
 | `ModeConfig` | Custom mode configuration |
 | `RunResult` | Task execution result |
 | `HistoryEntry` | Single event in execution trace |
+| `Snapshot` | Checkpoint state (`verif.config.Snapshot`) |
 
 ### Key Methods
 
@@ -828,6 +910,8 @@ if __name__ == "__main__":
 | `harness.list_modes()` | List available modes |
 | `harness.get_mode_config(name)` | Get mode configuration |
 | `harness.provider.receive_user_response(id, answers)` | Respond to ask_user questions |
+| `harness.resume(checkpoint_id, ...)` | Resume from checkpoint |
+| `harness.snapshots` | Dict of checkpoints from last checkpointed run |
 
 ---
 

@@ -11,6 +11,7 @@ uv pip install -r requirements.txt
 # .env file with API keys
 echo "GEMINI_API_KEY=your_key" > .env
 echo "OPENAI_API_KEY=your_key" >> .env
+echo "ANTHROPIC_API_KEY=your_key" >> .env
 ```
 
 ```bash
@@ -55,6 +56,8 @@ Getting data in and results out.
 | `with_streaming.py` | Real-time event callbacks — see tool calls, model chunks, subagent activity as they happen. |
 | `with_code_execution.py` | Model writes and runs Python. Variables persist across calls. Files saved to artifacts dir. |
 | `with_file_artifact.py` | **Model saves CSV artifacts, post-generation script converts to .xlsx.** See [File Artifacts](#file-artifacts). |
+| `csv_research_and_calc.py` | **Model researches missing CSV fields AND computes derived metrics.** Starts with partial data, fills gaps via search + code. |
+| `plan_mode_writing_workflow.py` | **Plan as a repeatable writing playbook.** Phased workflow (Foundation → Structure → Draft → Refine), auto-generated rubric, streaming. |
 
 ### 3. Multi-Stage Workflows
 
@@ -66,6 +69,7 @@ Chain multiple harness runs into pipelines.
 | `iterate_workflow.py` | Run → get user feedback → classify feedback → iterate with refined rubric. Progressive refinement. |
 | `npi_iphone18.py` | Minimal-instruction variant: explore, select in one sentence, execute with auto rubric. |
 | `npi_iterate.py` | Load previous output, provide targeted feedback, iterate to refine. |
+| `with_checkpointing.py` | **Run → inspect checkpoints → fork with new direction.** Resume mid-execution with feedback + rubric update, no re-run. |
 
 ### 4. Extensibility
 
@@ -76,7 +80,6 @@ Chain multiple harness runs into pipelines.
 | `with_custom_executor.py` | Custom code executor with preamble — pre-loaded variables, imports, environment setup. |
 | `custom_mode_bizarro.py` | Define entirely new execution modes. Custom prompts, custom flow, registered at runtime. |
 | `standard_with_search.py` | Enable web search. Model delegates research to a search subagent. |
-
 ---
 
 ## Key Patterns
@@ -151,6 +154,10 @@ A few worth opening:
 - **`iterate_workflow_output.md`** — The model submits an answer. User says "use McKinsey data, needs board-level summary." Watch the feedback get classified into rubric-level vs answer-level changes, then the rubric itself gets rewritten before the next attempt.
 
 - **`bizarro_output.md`** — What happens when you invert the entire workflow. Anti-brief, failure rubric, deliberately break the answer, then rebuild. A custom mode registered at runtime.
+
+- **`saas_benchmark_output.md`** — Model starts with a sparse CSV (only company names + ARR), researches missing fields via web search, computes derived metrics via code execution. Shows the research + calculation pattern.
+
+- **`plan_mode_writing_workflow_output.md`** — Plan mode used as a repeatable writing playbook with phased execution and auto-generated rubric.
 
 ---
 

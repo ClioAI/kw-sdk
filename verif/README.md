@@ -8,7 +8,7 @@ Standalone SDK for AI-powered task orchestration with iterative verification.
 uv pip install -e .
 ```
 
-Requires `GEMINI_API_KEY` or `OPENAI_API_KEY` in environment (or pass via `ProviderConfig`).
+Requires `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY` in environment (or pass via `ProviderConfig`).
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ print(result.answer)
 from verif import RLHarness, ProviderConfig
 
 config = ProviderConfig(
-    name="gemini",           # "gemini" | "openai"
+    name="gemini",           # "gemini" | "openai" | "anthropic"
     api_key="...",           # Optional, defaults to env var
     thinking_level="HIGH",   # Gemini: LOW/MEDIUM/HIGH
 )
@@ -81,7 +81,7 @@ result = harness.run_single(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `provider` | `str \| ProviderConfig` | `"gemini"` | Provider name or config object |
+| `provider` | `str \| ProviderConfig` | `"gemini"` | Provider name or config object (`"gemini"`, `"openai"`, `"anthropic"`) |
 | `enable_search` | `bool` | `False` | Enable web search tool |
 | `enable_bash` | `bool` | `False` | Enable bash command execution |
 | `enable_code` | `bool` | `False` | Enable Python code execution |
@@ -90,6 +90,7 @@ result = harness.run_single(
 | `rubric` | `str \| None` | `None` | Pre-set evaluation rubric |
 | `on_event` | `callable` | `None` | Event callback for streaming |
 | `attachments` | `list[Attachment]` | `[]` | Files to include with task |
+| `checkpoint` | `bool` | `False` | Enable state checkpointing (pass to `run_single()`) |
 
 ## Wrapper Responsibilities
 
@@ -327,6 +328,28 @@ harness = RLHarness(
 - **Artifacts**: Files saved to `artifacts_dir` are tracked and returned in result
 - **Libraries**: Common packages available (pandas, openpyxl, matplotlib, etc.)
 
+### Checkpointing & Resume
+
+```python
+from verif import RLHarness
+
+harness = RLHarness(provider="gemini", enable_search=True)
+
+# Run with checkpointing enabled
+result = harness.run_single("Analyze Greek mythology power dynamics.", checkpoint=True)
+
+# Inspect available checkpoints
+for snap_id, snap in harness.snapshots.items():
+    print(f"{snap_id} (step {snap.step})")
+
+# Resume from a checkpoint with feedback
+resumed = harness.resume(
+    checkpoint_id="<snap_id>",
+    feedback="Focus more on the Trojan War rivalries.",
+    rubric_update="Must include Achilles and divine intervention.",
+)
+```
+
 ## Exports
 
 ```python
@@ -337,4 +360,5 @@ from verif import (
     HistoryEntry,   # Event type
     Attachment,     # File attachment
 )
+from verif.config import Snapshot  # Checkpoint state
 ```
