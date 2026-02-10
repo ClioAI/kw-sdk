@@ -1,6 +1,6 @@
 from .base import BaseProvider, HistoryEntry
 
-__all__ = ["BaseProvider", "HistoryEntry", "GeminiProvider", "OpenAIProvider"]
+__all__ = ["BaseProvider", "HistoryEntry", "GeminiProvider", "OpenAIProvider", "AnthropicProvider"]
 
 
 def __getattr__(name):
@@ -10,4 +10,7 @@ def __getattr__(name):
     if name == "OpenAIProvider":
         from .openai import OpenAIProvider
         return OpenAIProvider
+    if name == "AnthropicProvider":
+        from .anthropic import AnthropicProvider
+        return AnthropicProvider
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .config import ProviderConfig, Prompt, Attachment, CompactionConfig, ModeConfig
+from .config import ProviderConfig, Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot
 from .providers.base import BaseProvider, HistoryEntry, PlanResult, _prompt_to_log
 from .executor import CodeExecutor
 from .modes import get_mode, MODES
@@ -26,7 +26,12 @@ def load_provider(config: ProviderConfig) -> BaseProvider:
             os.environ["OPENAI_API_KEY"] = config.api_key
         from .providers.openai import OpenAIProvider
         return OpenAIProvider()
-    raise ValueError(f"Unknown provider: {config.name}. Available: gemini, openai")
+    elif config.name == "anthropic":
+        if config.api_key:
+            os.environ["ANTHROPIC_API_KEY"] = config.api_key
+        from .providers.anthropic import AnthropicProvider
+        return AnthropicProvider()
+    raise ValueError(f"Unknown provider: {config.name}. Available: gemini, openai, anthropic")
 
 
 @dataclass
@@ -127,11 +132,17 @@ class RLHarness:
     # PUBLIC: UNIFIED ENTRY POINT
     # =========================================================================
     
+    @property
+    def snapshots(self) -> dict[str, Snapshot]:
+        """Checkpoints from the last checkpointed run."""
+        return self.provider.snapshots
+
     def run_single(
         self,
         task: Prompt,
         ground_truth: str = "",
         mode: str | None = None,
+        checkpoint: bool = False,
         # Mode-specific kwargs
         num_takes: int = 0,  # explore mode
         plan: str | None = None,  # plan mode (skip pre-execution if provided)
@@ -158,7 +169,10 @@ class RLHarness:
         task_text = _prompt_to_log(task)
         
         self.provider.clear_history()
-        
+        self.provider._checkpoint = checkpoint
+        self.provider._run_id = ""
+        self.provider.snapshots = {}
+
         # Collect mode-specific kwargs for orchestrator
         mode_kwargs = {}
         
@@ -208,6 +222,75 @@ class RLHarness:
             mode=mode_name,
             plan=plan or "",
             brief=self.provider.brief or "",
+        )
+
+    # =========================================================================
+    # RESUME: CHECKPOINT-BASED RESUME
+    # =========================================================================
+
+    def resume(
+        self,
+        checkpoint_id: str | None = None,
+        snapshot: Snapshot | None = None,
+        feedback: str | None = None,
+        rubric_update: str | None = None,
+        ground_truth: str = "",
+    ) -> RunResult:
+        """Resume execution from a checkpoint.
+
+        Pass either checkpoint_id (looked up from last run's snapshots) or
+        a Snapshot object directly. Optionally inject feedback and/or rubric update.
+
+        Args:
+            checkpoint_id: ID from self.snapshots
+            snapshot: Snapshot object directly
+            feedback: Optional feedback injected as user message before resuming
+            rubric_update: Optional rubric changes to merge (e.g. "add criteria for demigod analysis")
+            ground_truth: For eval tracking
+
+        Returns:
+            RunResult from the resumed trajectory
+        """
+        if snapshot is None:
+            if checkpoint_id is None:
+                raise ValueError("Provide checkpoint_id or snapshot")
+            snapshot = self.snapshots.get(checkpoint_id)
+            if snapshot is None:
+                raise KeyError(f"Checkpoint '{checkpoint_id}' not found. Available: {list(self.snapshots.keys())}")
+
+        self.provider._checkpoint = True  # keep checkpointing on resumed runs
+
+        # Merge rubric update if provided and rubric exists at this checkpoint
+        if rubric_update and snapshot.state.get("rubric"):
+            from .prompts import RUBRIC_MERGER
+            self.provider.log("system", "[Resume] Merging rubric update...")
+            merged = self.provider.generate(
+                RUBRIC_MERGER.format(rubric=snapshot.state["rubric"], update=rubric_update),
+                _log=False,
+            )
+            snapshot.state["rubric"] = merged
+            self.provider.log("system", f"[Resume] Rubric merged with: {rubric_update[:100]}...")
+
+        try:
+            answer = self.provider.resume_from_snapshot(
+                snapshot=snapshot,
+                feedback=feedback,
+                max_iterations=self.max_iterations,
+            )
+        except Exception as e:
+            self._sync_history()
+            self.provider.log("system", f"Error: {e}")
+            raise
+
+        self._sync_history()
+
+        return RunResult(
+            task=snapshot.state.get("mode", "resumed"),
+            ground_truth=ground_truth,
+            answer=answer,
+            rubric=self.provider.rubric or "",
+            history=self.history,
+            mode=snapshot.state.get("mode", "standard"),
         )
 
     # =========================================================================

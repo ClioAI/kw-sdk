@@ -1,8 +1,10 @@
+import copy
 import time
 import logging
 import subprocess
 import re
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ from ..prompts import (
     EXPLORE_ORCHESTRATOR, EXPLORE_BRIEF, EXPLORE_VERIFIER, ORCHESTRATOR, ORCHESTRATOR_WITH_PLAN,
     ITERATE_ORCHESTRATOR, ASK_USER_ADDENDUM
 )
-from ..config import Prompt, Attachment, CompactionConfig, ModeConfig
+from ..config import Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot
 from ..modes import get_mode, get_tools_for_mode
 
 
@@ -72,6 +74,7 @@ DANGEROUS_PATTERNS = [
 MAX_CONTEXT_TOKENS = {
     "openai": 1_000_000,
     "gemini": 1_000_000,
+    "anthropic": 200_000,
 }
 
 
@@ -327,6 +330,10 @@ class BaseProvider(ABC):
         self._user_response_events: dict[str, threading.Event] = {}
         self._pending_user_questions: set[str] = set()
         self._user_clarifications: list[dict] = []  # [{question_id, questions, response, timestamp}]
+        # Checkpointing
+        self.snapshots: dict[str, Snapshot] = {}
+        self._checkpoint: bool = False
+        self._run_id: str = ""
 
     def _next_subagent_id(self) -> str:
         """Generate unique ID for subagent tracking."""
@@ -908,12 +915,41 @@ class BaseProvider(ABC):
         system: str,
         tool_names: list[str],
         max_iterations: int,
+        _context: object = None,
+        _start_iteration: int = 0,
     ) -> str:
-        """Common orchestrator loop - providers implement the abstract methods."""
-        context = self._init_context(task, system, tool_names)
+        """Common orchestrator loop - providers implement the abstract methods.
+
+        Args:
+            _context: Pre-built context for resume. If None, initializes fresh.
+            _start_iteration: Starting iteration (for resume, adjusts remaining iterations).
+        """
+        context = _context if _context is not None else self._init_context(task, system, tool_names)
         last_tools = []
 
-        for iteration in range(max_iterations):
+        if self._checkpoint and not self._run_id:
+            self._run_id = uuid.uuid4().hex[:12]
+
+        for iteration in range(_start_iteration, max_iterations):
+            # Snapshot before model call
+            if self._checkpoint:
+                snap_id = f"{self._run_id}:step:{iteration}"
+                self.snapshots[snap_id] = Snapshot(
+                    id=snap_id,
+                    step=iteration,
+                    context=copy.deepcopy(context),
+                    state={
+                        "rubric": self.rubric,
+                        "brief": self.brief,
+                        "submitted_answer": self.submitted_answer,
+                        "_brief_created": self._brief_created,
+                        "mode": self.mode,
+                    },
+                    history_index=len(self.history),
+                    tool_names=list(tool_names),
+                    system=system,
+                )
+
             step_desc = f"iteration {iteration}" + (f" (after {', '.join(last_tools)})" if last_tools else "")
 
             try:
@@ -944,6 +980,46 @@ class BaseProvider(ABC):
                 return self.submitted_answer
 
         return self.submitted_answer or "Max iterations reached"
+
+    def resume_from_snapshot(
+        self,
+        snapshot: Snapshot,
+        feedback: str | None = None,
+        max_iterations: int = 30,
+    ) -> str:
+        """Resume orchestrator from a snapshot, optionally injecting feedback.
+
+        Returns the answer string. Caller (harness) wraps into RunResult.
+        """
+        # Restore state
+        context = copy.deepcopy(snapshot.context)
+        self.rubric = snapshot.state["rubric"]
+        self.brief = snapshot.state["brief"]
+        self.submitted_answer = snapshot.state["submitted_answer"]
+        self._brief_created = snapshot.state["_brief_created"]
+        self.mode = snapshot.state["mode"]
+
+        # Trim history to snapshot point
+        self.history = self.history[:snapshot.history_index]
+
+        # New run_id for the resumed trajectory
+        self._run_id = uuid.uuid4().hex[:12]
+
+        # Inject feedback if provided
+        if feedback:
+            self._inject_feedback(context, feedback)
+            self.log("user", f"[Resume feedback] {feedback}")
+
+        self.log("system", f"[Resume] from {snapshot.id}, step {snapshot.step}")
+
+        return self._orchestrator_loop(
+            task="",  # unused when _context is provided
+            system=snapshot.system,
+            tool_names=snapshot.tool_names,
+            max_iterations=max_iterations,
+            _context=context,
+            _start_iteration=snapshot.step,
+        )
 
     def search_files(self, query: str, path: str = ".") -> str:
         """File search subagent - uses bash + read_file, returns summary."""
@@ -1027,4 +1103,12 @@ class BaseProvider(ABC):
     @abstractmethod
     def _rebuild_context_with_summary(self, context: object, summary: str, keep_recent: int) -> object:
         """Rebuild context with summary replacing middle section."""
+        pass
+
+    @abstractmethod
+    def _inject_feedback(self, context: object, text: str) -> None:
+        """Append a user message with feedback text to context in provider-native format.
+
+        Required for checkpointing resume. New providers must implement this.
+        """
         pass

@@ -522,6 +522,9 @@ class OpenAIProvider(BaseProvider):
                 i += 1
         return boundaries
 
+    def _inject_feedback(self, context: dict, text: str) -> None:
+        context["messages"].append({"role": "user", "content": text})
+
     def _rebuild_context_with_summary(self, context: dict, summary: str, keep_recent: int) -> dict:
         """Rebuild OpenAI context with summary replacing middle section.
 

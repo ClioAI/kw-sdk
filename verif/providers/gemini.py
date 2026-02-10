@@ -508,6 +508,9 @@ class GeminiProvider(BaseProvider):
                 i += 1
         return boundaries
 
+    def _inject_feedback(self, context: dict, text: str) -> None:
+        context["contents"].append(types.Content(role="user", parts=[types.Part.from_text(text=text)]))
+
     def _rebuild_context_with_summary(self, context: dict, summary: str, keep_recent: int) -> dict:
         """Rebuild Gemini context with summary replacing middle section.
 

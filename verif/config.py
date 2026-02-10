@@ -53,6 +53,17 @@ Prompt = Union[str, list[Union[str, Attachment]]]
 
 
 @dataclass
+class Snapshot:
+    id: str                # "{run_id}:step:{step}"
+    step: int
+    context: dict          # deep copy of provider-native context
+    state: dict            # rubric, brief, submitted_answer, _brief_created, mode
+    history_index: int     # index into history[] at this point
+    tool_names: list[str]
+    system: str
+
+
+@dataclass
 class CompactionConfig:
     enabled: bool = True
     threshold: float = 0.8  # Trigger at 80% of max context
