@@ -294,13 +294,14 @@ Maximize parallelism - batch independent calls:
 
 ## OUTPUT REQUIREMENTS
 Each take must:
-- Be a FINISHED PRODUCT, not an analysis of how to make one
+- Be a FINISHED PRODUCT, not an analysis of how to make one.
+- Don't write full essays. Your audience is CxO level who need enough to differentiate and pick, not more.
 - If task asks for a speech, deliver actual speech content
 - If task asks for a strategy, deliver the actual strategy
 - State assumptions explicitly
 - Include counterfactual section (added AFTER the take, reviewing what could make it wrong)
 
-Separate takes with === on its own line.
+Separate takes with === on its own line after each take.
 End with set-level gaps: what's missing from the whole set?
 
 ## DISTINCTNESS - SAMPLE THE FULL DISTRIBUTION

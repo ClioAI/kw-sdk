@@ -65,7 +65,7 @@ class OpenAIProvider(BaseProvider):
         kwargs = {
             "model": MODEL_ID,
             "input": input_messages,
-            "reasoning": {"effort": self.reasoning_effort},
+            "reasoning": {"effort": self.reasoning_effort, "summary": "auto"},
             "stream": True,
         }
         if tools:
@@ -76,7 +76,7 @@ class OpenAIProvider(BaseProvider):
                 text_parts.append(event.delta)
                 self.emit(event_type, event.delta, meta if meta else None)
 
-            elif event.type == "response.reasoning_summary_part.delta":
+            elif extract_function_calls and event.type == "response.reasoning_summary_part.delta":
                 self.emit("thinking", event.delta)
 
             elif extract_function_calls and event.type == "response.output_item.added":
@@ -114,7 +114,8 @@ class OpenAIProvider(BaseProvider):
 
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
-                 stream: bool = False, subagent_id: str = None) -> str:
+                 stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
+                 stream_meta: dict = None) -> str:
         if _log:
             self.log("user", prompt)
             if system:
@@ -127,21 +128,25 @@ class OpenAIProvider(BaseProvider):
 
         tools = [{"type": "web_search"}] if enable_search else None
 
-        # Streaming path for subagents - emit events without storing in history
+        # Streaming path - emit events without storing in history
         if stream:
-            meta = {"subagent_id": subagent_id} if subagent_id else {}
-            self.emit("subagent_start", prompt, meta)
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
             text, _, _ = self._stream_generate(
                 input_messages=input_messages,
                 tools=tools,
-                event_type="subagent_chunk",
+                event_type=event_type,
                 meta=meta,
             )
-            self.emit("subagent_end", text, meta)
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
             return text
 
         # Blocking path (existing)
-        kwargs = {"model": MODEL_ID, "input": input_messages, "reasoning": {"effort": self.reasoning_effort}}
+        kwargs = {"model": MODEL_ID, "input": input_messages, "reasoning": {"effort": self.reasoning_effort, "summary": "auto"}}
         if tools:
             kwargs["tools"] = tools
 
@@ -184,7 +189,7 @@ class OpenAIProvider(BaseProvider):
                     model=MODEL_ID,
                     input=input_messages,
                     tools=tools,
-                    reasoning={"effort": self.reasoning_effort},
+                    reasoning={"effort": self.reasoning_effort, "summary": "auto"},
                 ),
                 logger=debug_logger
             )
@@ -236,7 +241,7 @@ class OpenAIProvider(BaseProvider):
                                 ],
                             }
                         ],
-                        reasoning={"effort": self.reasoning_effort},
+                        reasoning={"effort": self.reasoning_effort, "summary": "auto"},
                     ),
                     logger=debug_logger
                 )
@@ -263,7 +268,7 @@ class OpenAIProvider(BaseProvider):
                                 input=[
                                     {"role": "user", "content": f"{prompt}\n\n---\nPDF Content:\n{pdf_text}"}
                                 ],
-                                reasoning={"effort": self.reasoning_effort},
+                                reasoning={"effort": self.reasoning_effort, "summary": "auto"},
                             ),
                             logger=debug_logger
                         )
@@ -285,7 +290,7 @@ class OpenAIProvider(BaseProvider):
                             input=[
                                 {"role": "user", "content": f"{prompt}\n\n---\nFile Content:\n{content}"}
                             ],
-                            reasoning={"effort": self.reasoning_effort},
+                            reasoning={"effort": self.reasoning_effort, "summary": "auto"},
                         ),
                         logger=debug_logger
                     )
@@ -315,7 +320,7 @@ class OpenAIProvider(BaseProvider):
 
     # === Orchestrator context management ===
     def _init_context(self, task: Prompt, system: str, tool_names: list[str]) -> dict:
-        tools = [_to_openai_tool(TOOL_DEFINITIONS[t]) for t in tool_names]
+        tools = [_to_openai_tool(self.get_tool_definition(t)) for t in tool_names]
         user_content = self._prompt_to_content(task)
         messages = [
             {"role": "system", "content": system},
@@ -395,7 +400,7 @@ class OpenAIProvider(BaseProvider):
                 model=MODEL_ID,
                 input=context["messages"],
                 tools=context["tools"],
-                reasoning={"effort": self.reasoning_effort},
+                reasoning={"effort": self.reasoning_effort, "summary": "auto"},
             ),
             logger=debug_logger
         )

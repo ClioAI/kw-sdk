@@ -8,6 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 
 from ..prompts import (
@@ -17,6 +18,9 @@ from ..prompts import (
 )
 from ..config import Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot
 from ..modes import get_mode, get_tools_for_mode
+
+if TYPE_CHECKING:
+    from ..executor import CodeExecutor
 
 
 # Prompt registry - maps string names to actual prompt objects
@@ -315,10 +319,11 @@ class BaseProvider(ABC):
         self.brief: str | None = None
         self.submitted_answer: str | None = None
         self.on_log: callable = None
-        self.code_executor = None  # Set by harness if enable_code=True
+        self.code_executor: "CodeExecutor | None" = None  # Set by harness if enable_code=True
         self.enable_search: bool = False  # Set by harness, used by spawn_subagent
         self.compaction_config = CompactionConfig()  # Default config
         self._brief_created = False  # Track if brief has been created
+        self._brief_counter: int = 0
         # Streaming flags
         self.stream: bool = False
         self.stream_subagents: bool = False
@@ -368,6 +373,7 @@ class BaseProvider(ABC):
         self.brief = None
         self.submitted_answer = None
         self._brief_created = False
+        self._brief_counter = 0
         self._user_responses = {}
         self._user_response_events = {}
         self._pending_user_questions = set()
@@ -394,13 +400,47 @@ class BaseProvider(ABC):
             lines.append(f"### {i+1}. {icon} {e.entry_type.upper()}\n```\n{e.content}\n```\n")
         return "\n".join(lines)
 
+    def _is_remote_executor(self) -> bool:
+        return self.code_executor is not None and hasattr(self.code_executor, "execute_tool")
+
+    def get_tool_definition(self, name: str) -> dict:
+        """Get tool definition, with sandbox-aware overrides for execute_code."""
+        defn = TOOL_DEFINITIONS[name]
+        if name == "execute_code" and self._is_remote_executor():
+            cfg = getattr(self.code_executor, "sandbox_config", {}) or {}
+            lang = cfg.get("type", "Python")
+            caps = cfg.get("capabilities", [])
+            # Build concise helper list from capabilities beyond execute_code
+            helpers = [c for c in caps if c != "execute_code"]
+            desc = f"Execute {lang} code in a remote sandbox."
+            # Extract helper functions from constraints for the code param description
+            code_desc = f"{lang} code to execute."
+            constraints = cfg.get("constraints", "")
+            if constraints:
+                code_desc += f" {constraints}"
+            defn = {**defn, "description": desc, "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string", "description": code_desc}},
+                "required": ["code"],
+            }}
+        return defn
+
     # === Common tool execution ===
     def _execute_tool(self, name: str, args: dict) -> str:
         if name == "create_brief":
             # Get brief prompt from mode config via registry
             mode_config = get_mode(self.mode)
             brief_prompt = PROMPTS[mode_config.brief_prompt]
-            result = self.generate(args.get("task", ""), system=brief_prompt, _log=False)
+            self._brief_counter += 1
+            instruction = args.get("task", "")
+            self.emit("brief_start", instruction, {
+                "brief_index": self._brief_counter,
+            })
+            result = self.generate(
+                instruction, system=brief_prompt, _log=False,
+                stream=self.stream, stream_event_type="brief_chunk",
+                stream_meta={"brief_index": self._brief_counter},
+            )
             self._brief_created = True
             self.brief = result
             return result
@@ -411,6 +451,7 @@ class BaseProvider(ABC):
             brief = args.get("brief", "")
             try:
                 self.rubric = self.generate(brief, system=RUBRIC_CREATOR, _log=False)
+                self.emit("rubric_created", self.rubric)
                 return "Rubric created."
             except Exception as e:
                 self.rubric = f"ERROR: {e}"
@@ -446,19 +487,26 @@ class BaseProvider(ABC):
                     for c in self._user_clarifications
                 )
                 verification_prompt += f"\n\n## User Clarifications\nThe user provided these clarifications during execution. Rubric may be stale around these points - verify intent based on clarifications, not just literal rubric criteria:\n{clarifications_text}"
-            return self.generate(verification_prompt, system=VERIFICATION, _log=False)
+            return self.generate(
+                verification_prompt, system=VERIFICATION, _log=False,
+                stream=self.stream, stream_event_type="verification_chunk",
+            )
 
         elif name == "submit_answer":
             self.submitted_answer = args.get("answer", "")
             return "SUBMITTED"
 
         elif name == "bash":
+            if self._is_remote_executor():
+                return self.code_executor.execute_tool("bash", args)
             return self._execute_bash(
                 args.get("command", ""),
                 args.get("working_directory")
             )
 
         elif name == "read_file":
+            if self._is_remote_executor():
+                return self.code_executor.execute_tool("read_file", args)
             file_path = args.get("file_path", "")
             prompt = args.get("prompt", "Provide a detailed summary of this file's contents.")
             return self.read_file_with_vision(file_path, prompt)
@@ -478,6 +526,8 @@ class BaseProvider(ABC):
             return output if output.strip() else "[Code executed with no output]"
 
         elif name == "search_files":
+            if self._is_remote_executor():
+                return self.code_executor.execute_tool("search_files", args)
             query = args.get("query", "")
             path = args.get("path", ".")
             return self.search_files(query, path)
@@ -1037,13 +1087,11 @@ class BaseProvider(ABC):
             if not func_calls:
                 return output_text or "No results found."
 
-            # Execute tools (bash, read_file only)
+            # Execute tools via _execute_tool (respects remote executor routing)
             results = []
             for fc in func_calls:
-                if fc.name == "bash":
-                    results.append(self._execute_bash(fc.args.get("command", ""), fc.args.get("working_directory", path)))
-                elif fc.name == "read_file":
-                    results.append(self.read_file_with_vision(fc.args.get("file_path", ""), fc.args.get("prompt", "Summarize this file.")))
+                if fc.name in ("bash", "read_file"):
+                    results.append(self._execute_tool(fc.name, fc.args))
                 else:
                     results.append(f"Unknown tool: {fc.name}")
 
@@ -1054,8 +1102,11 @@ class BaseProvider(ABC):
     # === Abstract methods - provider must implement ===
     @abstractmethod
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
-                 stream: bool = False, subagent_id: str = None) -> str:
-        """Simple generation without tools. If stream=True and subagent_id provided, emit subagent_chunk events."""
+                 stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
+                 stream_meta: dict = None) -> str:
+        """Simple generation without tools. If stream=True, emit streaming events.
+        stream_event_type overrides the default event type (subagent_chunk).
+        stream_meta is forwarded as metadata on each chunk event."""
         pass
 
     @abstractmethod

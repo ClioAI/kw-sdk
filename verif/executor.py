@@ -157,29 +157,40 @@ class RemoteExecutor:
 
     def execute(self, code: str) -> CodeResult:
         """Execute code by delegating to frontend. Blocks until response."""
+        result = self.execute_tool("execute_code", {"code": code})
+        if isinstance(result, CodeResult):
+            return result
+        # Shouldn't happen, but fallback
+        return CodeResult(stdout=str(result), stderr="", error=None)
+
+    def execute_tool(self, tool_name: str, args: dict) -> CodeResult | str:
+        """Execute any tool by delegating to frontend. Returns CodeResult for execute_code, str for others."""
         request_id = str(uuid.uuid4())
 
         if self._loop and self._loop.is_running():
-            # Create event in the event loop's context
             future = asyncio.run_coroutine_threadsafe(
-                self._execute_async(request_id, code), self._loop
+                self._execute_tool_async(request_id, tool_name, args), self._loop
             )
             try:
                 return future.result(timeout=self.timeout + 5)
             except Exception as e:
-                return CodeResult(stdout="", stderr="", error=f"Remote execution failed: {e}")
+                if tool_name == "execute_code":
+                    return CodeResult(stdout="", stderr="", error=f"Remote execution failed: {e}")
+                return f"Error: Remote execution failed: {e}"
         else:
-            return CodeResult(stdout="", stderr="", error="No event loop available")
+            if tool_name == "execute_code":
+                return CodeResult(stdout="", stderr="", error="No event loop available")
+            return "Error: No event loop available"
 
-    async def _execute_async(self, request_id: str, code: str) -> CodeResult:
+    async def _execute_tool_async(self, request_id: str, tool_name: str, args: dict) -> CodeResult | str:
         event = asyncio.Event()
         self.pending[request_id] = event
 
         event_data = {
             "request_id": request_id,
             "session_id": self.session_id,
-            "tool": "execute_code",
-            "args": {"code": code},
+            "tool": tool_name,
+            "args": args,
             "timeout_ms": self.timeout * 1000,
         }
         if self.sandbox_config:
@@ -189,19 +200,27 @@ class RemoteExecutor:
         try:
             await asyncio.wait_for(event.wait(), timeout=self.timeout)
             result = self.results.pop(request_id, {})
-            if result.get("success"):
-                data = result.get("data", {})
-                return CodeResult(
-                    stdout=data.get("stdout", ""),
-                    stderr=data.get("stderr", ""),
-                    artifacts=data.get("artifacts", []),
-                    error=None,
-                )
+            if tool_name == "execute_code":
+                if result.get("success"):
+                    data = result.get("data", {})
+                    return CodeResult(
+                        stdout=data.get("stdout", ""),
+                        stderr=data.get("stderr", ""),
+                        artifacts=data.get("artifacts", []),
+                        error=None,
+                    )
+                else:
+                    return CodeResult(stdout="", stderr="", error=result.get("error", "Unknown error"))
             else:
-                return CodeResult(stdout="", stderr="", error=result.get("error", "Unknown error"))
+                if result.get("success"):
+                    return result.get("data", "")
+                else:
+                    return f"Error: {result.get('error', 'Unknown error')}"
         except asyncio.TimeoutError:
             self.pending.pop(request_id, None)
-            return CodeResult(stdout="", stderr="", error=f"Tool timed out after {self.timeout}s")
+            if tool_name == "execute_code":
+                return CodeResult(stdout="", stderr="", error=f"Tool timed out after {self.timeout}s")
+            return f"Error: Tool timed out after {self.timeout}s"
 
     def receive_response(self, request_id: str, result: dict):
         """Called by /tool/respond endpoint."""
@@ -210,19 +229,25 @@ class RemoteExecutor:
             self.pending[request_id].set()
 
     def get_pending_requests(self) -> list[dict]:
-        return [{"request_id": rid, "tool": "execute_code"} for rid in self.pending]
+        return [{"request_id": rid} for rid in self.pending]
 
     def get_sandbox_context(self) -> str | None:
         """Return sandbox description for orchestrator prompt."""
         if not self.sandbox_config:
             return None
         lines = []
-        if t := self.sandbox_config.get("type"):
-            lines.append(f"- Runtime: {t}")
+        if rt := self.sandbox_config.get("type") or self.sandbox_config.get("runtime"):
+            lines.append(f"- Runtime: {rt}")
+        if env := self.sandbox_config.get("version") or self.sandbox_config.get("environment"):
+            lines.append(f"- Version: {env}")
+        if caps := self.sandbox_config.get("capabilities"):
+            lines.append(f"- Capabilities: {', '.join(caps)}")
         if pkgs := self.sandbox_config.get("packages"):
-            lines.append(f"- Available packages: {', '.join(pkgs)}")
+            lines.append(f"- Packages: {', '.join(pkgs)}")
         if constraints := self.sandbox_config.get("constraints"):
             lines.append(f"- Constraints: {constraints}")
+        if instructions := self.sandbox_config.get("instructions"):
+            lines.append(f"- Instructions: {instructions}")
         return "\n".join(lines) if lines else None
 
     def reset(self):

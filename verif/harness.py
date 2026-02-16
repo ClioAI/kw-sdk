@@ -17,20 +17,17 @@ from .modes import get_mode, MODES
 
 def load_provider(config: ProviderConfig) -> BaseProvider:
     if config.name == "gemini":
-        if config.api_key:
-            os.environ["GEMINI_API_KEY"] = config.api_key
-        from .providers.gemini import GeminiProvider
-        return GeminiProvider()
+        from .providers import gemini
+        gemini.GEMINI_API_KEY = config.api_key or os.environ.get("GEMINI_API_KEY")
+        return gemini.GeminiProvider(thinking_level=config.thinking_level)
     elif config.name == "openai":
-        if config.api_key:
-            os.environ["OPENAI_API_KEY"] = config.api_key
-        from .providers.openai import OpenAIProvider
-        return OpenAIProvider()
+        from .providers import openai as oai
+        oai.OPENAI_API_KEY = config.api_key or os.environ.get("OPENAI_API_KEY")
+        return oai.OpenAIProvider(reasoning_effort=config.reasoning_effort)
     elif config.name == "anthropic":
-        if config.api_key:
-            os.environ["ANTHROPIC_API_KEY"] = config.api_key
-        from .providers.anthropic import AnthropicProvider
-        return AnthropicProvider()
+        from .providers import anthropic as anth
+        anth.ANTHROPIC_API_KEY = config.api_key or os.environ.get("ANTHROPIC_API_KEY")
+        return anth.AnthropicProvider()
     raise ValueError(f"Unknown provider: {config.name}. Available: gemini, openai, anthropic")
 
 
@@ -117,13 +114,13 @@ class RLHarness:
             self.provider.on_log = on_event
         if compaction_config:
             self.provider.compaction_config = compaction_config
-        if enable_code:
-            if not code_executor:
-                raise ValueError(
-                    "enable_code=True requires a code_executor. "
-                    "Use SubprocessExecutor(artifacts_dir) for unsandboxed local execution."
-                )
+        if code_executor:
             self.provider.code_executor = code_executor
+        elif enable_code:
+            raise ValueError(
+                "enable_code=True requires a code_executor. "
+                "Use SubprocessExecutor(artifacts_dir) for unsandboxed local execution."
+            )
 
     def _sync_history(self):
         self.history = self.provider.history.copy()
@@ -304,6 +301,7 @@ class RLHarness:
         rubric: str,
         feedback: str | None = None,
         rubric_update: str | None = None,
+        checkpoint: bool = False,
     ) -> IterateResult:
         """Stateless refinement operation.
 
@@ -325,6 +323,8 @@ class RLHarness:
         from .prompts import RUBRIC_MERGER
 
         self.provider.clear_history()
+        self.provider._checkpoint = checkpoint
+        self.provider.snapshots = {}
         self.provider.log("system", f"[Iterate] task={task[:100]}...")
 
         # 1. Merge rubric if update provided

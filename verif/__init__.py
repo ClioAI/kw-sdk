@@ -1,18 +1,18 @@
-from .harness import RLHarness, RunResult
-from .config import ProviderConfig, Attachment, Prompt, CompactionConfig, ModeConfig
+from .harness import RLHarness, RunResult, IterateResult
+from .config import ProviderConfig, Attachment, Prompt, CompactionConfig, ModeConfig, Snapshot
 from .providers.base import BaseProvider, HistoryEntry, PlanResult
-from .executor import CodeExecutor, SubprocessExecutor, CodeResult
-from .modes import get_mode, get_tools_for_mode, MODES, STANDARD_MODE, PLAN_MODE, EXPLORE_MODE
+from .executor import CodeExecutor, SubprocessExecutor, RemoteExecutor, CodeResult
+from .modes import get_mode, get_tools_for_mode, MODES, STANDARD_MODE, PLAN_MODE, EXPLORE_MODE, ITERATE_MODE
 
 __all__ = [
     # Core
-    "RLHarness", "RunResult", "PlanResult",
+    "RLHarness", "RunResult", "IterateResult", "PlanResult",
     # Config
-    "ProviderConfig", "Attachment", "Prompt", "CompactionConfig", "ModeConfig",
+    "ProviderConfig", "Attachment", "Prompt", "CompactionConfig", "ModeConfig", "Snapshot",
     # Modes
-    "get_mode", "get_tools_for_mode", "MODES", "STANDARD_MODE", "PLAN_MODE", "EXPLORE_MODE",
+    "get_mode", "get_tools_for_mode", "MODES", "STANDARD_MODE", "PLAN_MODE", "EXPLORE_MODE", "ITERATE_MODE",
     # Providers
     "BaseProvider", "HistoryEntry",
     # Executors
-    "CodeExecutor", "SubprocessExecutor", "CodeResult",
+    "CodeExecutor", "SubprocessExecutor", "RemoteExecutor", "CodeResult",
 ]

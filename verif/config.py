@@ -34,7 +34,7 @@ class ModeConfig:
 
 @dataclass
 class ProviderConfig:
-    name: str  # "gemini" | "openai"
+    name: str  # "gemini" | "openai" | "anthropic"
     api_key: str | None = None  # None = read from env
     thinking_level: str = "MEDIUM"  # gemini
     reasoning_effort: str = "medium"  # openai

@@ -32,7 +32,7 @@ class GeminiProvider(BaseProvider):
         self._verification_called = False
 
     def _thinking_config(self) -> types.ThinkingConfig:
-        return types.ThinkingConfig(thinking_level=self.thinking_level)
+        return types.ThinkingConfig(thinking_level=self.thinking_level, include_thoughts=True)
 
     def _debug_log(self, message: str):
         debug_logger.error(message)
@@ -64,8 +64,11 @@ class GeminiProvider(BaseProvider):
         ):
             if not chunk.candidates:
                 continue
+            parts = getattr(chunk.candidates[0].content, "parts", None)
+            if not parts:
+                continue
 
-            for part in chunk.candidates[0].content.parts:
+            for part in parts:
                 accumulated_parts.append(part)
 
                 # Text chunk (non-thinking) - emit only, don't store in history
@@ -73,8 +76,8 @@ class GeminiProvider(BaseProvider):
                     text_parts.append(part.text)
                     self.emit(event_type, part.text, meta if meta else None)
 
-                # Thinking chunk - emit only, don't store in history
-                if hasattr(part, "thought") and part.thought and part.text:
+                # Thinking chunk - only from orchestrator (extract_function_calls=True)
+                if extract_function_calls and hasattr(part, "thought") and part.thought and part.text:
                     self.emit("thinking", part.text)
 
                 # Function call (only for orchestrator) - arrives complete without FC streaming
@@ -110,7 +113,8 @@ class GeminiProvider(BaseProvider):
 
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
-                 stream: bool = False, subagent_id: str = None) -> str:
+                 stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
+                 stream_meta: dict = None) -> str:
         if _log:
             self.log("user", prompt)
             if system:
@@ -125,17 +129,21 @@ class GeminiProvider(BaseProvider):
                 types.Tool(url_context=types.UrlContext()),
             ]
 
-        # Streaming path for subagents - emit events without storing in history
+        # Streaming path - emit events without storing in history
         if stream:
-            meta = {"subagent_id": subagent_id} if subagent_id else {}
-            self.emit("subagent_start", prompt, meta)
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
             text, _, _ = self._stream_generate(
                 contents=prompt,
                 config=config,
-                event_type="subagent_chunk",
+                event_type=event_type,
                 meta=meta,
             )
-            self.emit("subagent_end", text, meta)
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
             return text
 
         # Blocking path (existing)
@@ -156,10 +164,11 @@ class GeminiProvider(BaseProvider):
         result = response.text or ""
         if enable_search and response.candidates:
             # Grounding metadata (from google_search)
-            if response.candidates[0].grounding_metadata:
+            gm = response.candidates[0].grounding_metadata
+            if gm and gm.grounding_chunks:
                 sources = [
                     chunk.web.uri
-                    for chunk in response.candidates[0].grounding_metadata.grounding_chunks
+                    for chunk in gm.grounding_chunks
                     if hasattr(chunk, "web") and chunk.web
                 ]
                 if sources:
@@ -167,7 +176,7 @@ class GeminiProvider(BaseProvider):
             # URL context metadata (from url_context)
             if hasattr(response.candidates[0], "url_context_metadata"):
                 url_meta = response.candidates[0].url_context_metadata
-                if url_meta and hasattr(url_meta, "url_metadata"):
+                if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
                     urls = [m.retrieved_url for m in url_meta.url_metadata if hasattr(m, "retrieved_url")]
                     if urls:
                         result += "\n\nURLs fetched:\n" + "\n".join(urls)
@@ -213,10 +222,11 @@ class GeminiProvider(BaseProvider):
 
         result = response.text or ""
         # Grounding metadata (from google_search)
-        if response.candidates and response.candidates[0].grounding_metadata:
+        gm = response.candidates[0].grounding_metadata if response.candidates else None
+        if gm and gm.grounding_chunks:
             sources = [
                 chunk.web.uri
-                for chunk in response.candidates[0].grounding_metadata.grounding_chunks
+                for chunk in gm.grounding_chunks
                 if hasattr(chunk, "web") and chunk.web
             ]
             if sources:
@@ -224,7 +234,7 @@ class GeminiProvider(BaseProvider):
         # URL context metadata (from url_context)
         if response.candidates and hasattr(response.candidates[0], "url_context_metadata"):
             url_meta = response.candidates[0].url_context_metadata
-            if url_meta and hasattr(url_meta, "url_metadata"):
+            if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
                 urls = [m.retrieved_url for m in url_meta.url_metadata if hasattr(m, "retrieved_url")]
                 if urls:
                     result += "\n\nURLs fetched:\n" + "\n".join(urls)
@@ -286,7 +296,7 @@ class GeminiProvider(BaseProvider):
     def _log_response(self, response):
         if not response.candidates:
             return
-        for part in response.candidates[0].content.parts:
+        for part in (getattr(response.candidates[0].content, "parts", None) or []):
             if hasattr(part, "thought") and part.thought and hasattr(part, "text") and part.text:
                 self.log("thinking", part.text)
             elif hasattr(part, "function_call") and part.function_call:
@@ -298,7 +308,7 @@ class GeminiProvider(BaseProvider):
     # === Orchestrator context management ===
     def _init_context(self, task: Prompt, system: str, tool_names: list[str]) -> dict:
         self._verification_called = False
-        tool_declarations = [TOOL_DEFINITIONS[t] for t in tool_names]
+        tool_declarations = [self.get_tool_definition(t) for t in tool_names]
         tools = types.Tool(function_declarations=tool_declarations)
 
         config = types.GenerateContentConfig(
@@ -407,7 +417,7 @@ class GeminiProvider(BaseProvider):
         context["contents"].append(response.candidates[0].content)
 
         # Debug log thought signatures
-        for i, part in enumerate(response.candidates[0].content.parts):
+        for i, part in enumerate(getattr(response.candidates[0].content, "parts", None) or []):
             if hasattr(part, 'function_call') and part.function_call:
                 has_sig = hasattr(part, 'thought_signature') and part.thought_signature
                 debug_logger.debug(f"part[{i}] {part.function_call.name} sig={'YES' if has_sig else 'NO'}")

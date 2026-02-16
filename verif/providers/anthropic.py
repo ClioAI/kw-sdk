@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-MODEL_ID = "claude-sonnet-4-5-20250929"
+MODEL_ID = "claude-opus-4-6"
 
 # Debug logger
 debug_logger = logging.getLogger("anthropic_debug")
@@ -75,9 +75,10 @@ class AnthropicProvider(BaseProvider):
 
         kwargs = {
             "model": MODEL_ID,
-            "max_tokens": 16000,
+            "max_tokens": 128000,
             "messages": messages,
-            "thinking": {"type": "enabled", "budget_tokens": self.thinking_budget},
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
         }
         if system:
             kwargs["system"] = system
@@ -98,7 +99,7 @@ class AnthropicProvider(BaseProvider):
                     if delta.type == "text_delta":
                         text_parts.append(delta.text)
                         self.emit(event_type, delta.text, meta if meta else None)
-                    elif delta.type == "thinking_delta":
+                    elif extract_function_calls and delta.type == "thinking_delta":
                         self.emit("thinking", delta.thinking)
                     elif delta.type == "input_json_delta":
                         current_tool_input_json += delta.partial_json
@@ -148,7 +149,8 @@ class AnthropicProvider(BaseProvider):
 
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
-                 stream: bool = False, subagent_id: str = None) -> str:
+                 stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
+                 stream_meta: dict = None) -> str:
         if _log:
             self.log("user", prompt)
             if system:
@@ -157,26 +159,31 @@ class AnthropicProvider(BaseProvider):
         messages = [{"role": "user", "content": prompt}]
         tools = [WEB_SEARCH_TOOL] if enable_search else None
 
-        # Streaming path for subagents
+        # Streaming path - emit events without storing in history
         if stream:
-            meta = {"subagent_id": subagent_id} if subagent_id else {}
-            self.emit("subagent_start", prompt, meta)
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
             text, _, _ = self._stream_generate(
                 messages=messages,
                 system=system or "",
                 tools=tools,
-                event_type="subagent_chunk",
+                event_type=event_type,
                 meta=meta,
             )
-            self.emit("subagent_end", text, meta)
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
             return text
 
         # Blocking path
         kwargs = {
             "model": MODEL_ID,
-            "max_tokens": 16000,
+            "max_tokens": 128000,
             "messages": messages,
-            "thinking": {"type": "enabled", "budget_tokens": self.thinking_budget},
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
         }
         if system:
             kwargs["system"] = system
@@ -210,16 +217,20 @@ class AnthropicProvider(BaseProvider):
             subagent_id=subagent_id,
         )
 
+    def _create(self, **kwargs):
+        """Stream-backed blocking call (required for large max_tokens)."""
+        with self.client.messages.stream(**kwargs) as s:
+            return s.get_final_message()
+
     def _generate_with_pause(self, kwargs: dict):
         """Handle pause_turn stop reason by continuing the conversation."""
-        response = self.client.messages.create(**kwargs)
-        # Handle pause_turn: API paused a long-running turn, continue it
+        response = self._create(**kwargs)
         while response.stop_reason == "pause_turn":
             kwargs["messages"] = kwargs["messages"] + [
                 {"role": "assistant", "content": response.content},
                 {"role": "user", "content": "Continue."},
             ]
-            response = self.client.messages.create(**kwargs)
+            response = self._create(**kwargs)
         return response
 
     def read_file_with_vision(self, file_path: str, prompt: str) -> str:
@@ -258,11 +269,12 @@ class AnthropicProvider(BaseProvider):
                     return f"Error: Cannot read binary file {file_path}. Supported: images, PDFs, text files."
 
             response = retry_on_error(
-                lambda: self.client.messages.create(
+                lambda: self._create(
                     model=MODEL_ID,
-                    max_tokens=16000,
+                    max_tokens=128000,
                     messages=[{"role": "user", "content": content}],
-                    thinking={"type": "enabled", "budget_tokens": self.thinking_budget},
+                    thinking={"type": "adaptive"},
+                    output_config={"effort": "medium"},
                 ),
                 logger=debug_logger,
             )
@@ -311,7 +323,7 @@ class AnthropicProvider(BaseProvider):
     # === Orchestrator context management ===
     def _init_context(self, task: Prompt, system: str, tool_names: list[str]) -> dict:
         self._verification_called = False
-        tools = [_to_anthropic_tool(TOOL_DEFINITIONS[t]) for t in tool_names]
+        tools = [_to_anthropic_tool(self.get_tool_definition(t)) for t in tool_names]
         user_content = self._prompt_to_content(task)
         messages = [{"role": "user", "content": user_content}]
         # Anthropic: thinking + tool_choice "any" is not allowed, always use "auto"
@@ -395,16 +407,17 @@ class AnthropicProvider(BaseProvider):
         # Blocking path
         kwargs = {
             "model": MODEL_ID,
-            "max_tokens": 16000,
+            "max_tokens": 128000,
             "system": context["system"],
             "messages": context["messages"],
             "tools": context["tools"],
             "tool_choice": context["tool_choice"],
-            "thinking": {"type": "enabled", "budget_tokens": self.thinking_budget},
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
         }
 
         response = retry_on_error(
-            lambda: self.client.messages.create(**kwargs),
+            lambda: self._create(**kwargs),
             logger=debug_logger,
         )
         self._log_response(response)
@@ -453,10 +466,13 @@ class AnthropicProvider(BaseProvider):
         tool_results = []
         for i, fc in enumerate(func_calls):
             tool_use_id = fc.raw.get("id") if isinstance(fc.raw, dict) else getattr(fc.raw, "id", "")
+            content = results[i]
+            if not isinstance(content, (str, list)):
+                content = str(content)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": results[i],
+                "content": content,
             })
         context["messages"].append({"role": "user", "content": tool_results})
 
