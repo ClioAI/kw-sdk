@@ -103,6 +103,18 @@ print(result.answer)  # The analysis
 print(result.rubric)  # Auto-generated evaluation criteria
 ```
 
+```python
+import asyncio
+from verif import AsyncRLHarness
+
+async def main():
+    harness = AsyncRLHarness(provider="openai", enable_search=True)
+    result = await harness.run_single("Analyze the economic impact of remote work on urban real estate.")
+    print(result.answer)
+
+asyncio.run(main())
+```
+
 ---
 
 ## Execution Modes

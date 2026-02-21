@@ -58,6 +58,19 @@ result = harness.run_single("Explain quantum entanglement in simple terms.")
 print(result.answer)
 ```
 
+```python
+import asyncio
+from verif import AsyncRLHarness, ProviderConfig
+
+async def main():
+    config = ProviderConfig(name="openai", reasoning_effort="medium")
+    harness = AsyncRLHarness(provider=config, enable_search=True)
+    result = await harness.run_single("Explain quantum entanglement in simple terms.")
+    print(result.answer)
+
+asyncio.run(main())
+```
+
 ### With Anthropic
 
 ```python

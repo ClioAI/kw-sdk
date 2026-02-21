@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import time
 import logging
 import subprocess
@@ -101,6 +102,21 @@ def retry_on_error(func, max_retries=3, backoff=2, logger=None):
             log.warning(f"RETRY attempt {attempt + 1} failed: {e}")
             log.info(f"Waiting {wait}s before retry...")
             time.sleep(wait)
+
+
+async def async_retry_on_error(func, max_retries=3, backoff=2, logger=None):
+    """Async retry with exponential backoff on API errors."""
+    log = logger or debug_logger
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = backoff ** attempt
+            log.warning(f"RETRY attempt {attempt + 1} failed: {e}")
+            log.info(f"Waiting {wait}s before retry...")
+            await asyncio.sleep(wait)
 
 
 # Base tool definitions (provider converts to its format)
@@ -404,6 +420,7 @@ class BaseProvider(ABC):
         # Delegation & background
         self._background_tasks: dict[str, BackgroundTask] = {}
         self._bg_executor = ThreadPoolExecutor(max_workers=3)
+        self._compaction_executor = ThreadPoolExecutor(max_workers=1)
         # Skills
         self._skill_index: str = ""  # Injected by harness
         self._skills_dir: str = ""  # Set by harness
@@ -494,6 +511,42 @@ class BaseProvider(ABC):
                 "required": ["code"],
             }}
         return defn
+
+    async def generate_async(
+        self,
+        prompt: str,
+        system: str = None,
+        _log: bool = True,
+        enable_search: bool = False,
+        stream: bool = False,
+        subagent_id: str = None,
+        stream_event_type: str = None,
+        stream_meta: dict = None,
+        tools: list[str] = None,
+        _tool_depth: int = 0,
+    ) -> str:
+        """Async generation fallback for providers without native async support."""
+        return await asyncio.to_thread(
+            self.generate,
+            prompt,
+            system,
+            _log,
+            enable_search,
+            stream,
+            subagent_id,
+            stream_event_type,
+            stream_meta,
+            tools,
+            _tool_depth,
+        )
+
+    async def search_async(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
+        """Async search fallback for providers without native async support."""
+        return await asyncio.to_thread(self.search, query, stream, subagent_id)
+
+    async def _call_model_async(self, context: object, step_desc: str, stream: bool = False) -> tuple[list[FunctionCall], str]:
+        """Async model-call fallback for providers without native async support."""
+        return await asyncio.to_thread(self._call_model, context, step_desc, stream)
 
     # === Common tool execution ===
     def _execute_tool(self, name: str, args: dict) -> str:
@@ -673,6 +726,172 @@ class BaseProvider(ABC):
 
         return f"Unknown tool: {name}"
 
+    async def _execute_tool_async(self, name: str, args: dict) -> str:
+        """Async tool execution path used by AsyncRLHarness."""
+        if name == "create_brief":
+            mode_config = get_mode(self.mode)
+            brief_prompt = PROMPTS[mode_config.brief_prompt]
+            self._brief_counter += 1
+            instruction = args.get("task", "")
+            self.emit("brief_start", instruction, {
+                "brief_index": self._brief_counter,
+            })
+            result = await self.generate_async(
+                instruction,
+                system=brief_prompt,
+                _log=False,
+                stream=self.stream,
+                stream_event_type="brief_chunk",
+                stream_meta={"brief_index": self._brief_counter},
+            )
+            self._brief_created = True
+            self.brief = result
+            return result
+
+        if name == "create_rubric":
+            if self.rubric:
+                return "Rubric already set (using pre-existing)."
+            brief = args.get("brief", "")
+            try:
+                self.rubric = await self.generate_async(brief, system=RUBRIC_CREATOR, _log=False)
+                self.emit("rubric_created", self.rubric)
+                return "Rubric created."
+            except Exception as e:
+                self.rubric = f"ERROR: {e}"
+                raise
+
+        if name == "delegate":
+            prompt = args.get("prompt", "")
+            tools = args.get("tools") or None
+            background = args.get("background", False)
+            subagent_id = self._next_subagent_id()
+
+            skill_name = args.get("skill")
+            if skill_name:
+                if self._skills_dir:
+                    from pathlib import Path
+                    skill_dir = Path(self._skills_dir) / skill_name
+                    if skill_dir.exists():
+                        from ..skills import inject_skill
+                        prompt = inject_skill(prompt, skill_name, self._skills_dir)
+                    else:
+                        self.log("tool_response", f"Skill '{skill_name}' not found, proceeding without it.")
+                else:
+                    self.log("tool_response", f"No skills configured, ignoring skill='{skill_name}'.")
+
+            if background:
+                task = asyncio.create_task(
+                    self.generate_async(
+                        prompt,
+                        _log=False,
+                        enable_search=self.enable_search if not tools else False,
+                        subagent_id=subagent_id,
+                        tools=tools,
+                    )
+                )
+                self._background_tasks[subagent_id] = BackgroundTask(
+                    id=subagent_id,
+                    future=task,
+                    prompt=prompt,
+                    started_at=time.time(),
+                )
+                return f"Agent {subagent_id} running in background. Results delivered when ready."
+
+            return await self.generate_async(
+                prompt,
+                _log=False,
+                enable_search=self.enable_search if not tools else False,
+                stream=self.stream_subagents,
+                subagent_id=subagent_id,
+                tools=tools,
+            )
+
+        if name == "build_skill":
+            context_text = args.get("context", "")
+            skill_name = args.get("name", "unnamed_skill")
+            subagent_id = self._next_subagent_id()
+            skill_prompt = (
+                f"Skill name: {skill_name}\n\n"
+                f"Learning context:\n{context_text}\n\n"
+                f"Save to: {self._skill_output_dir}/{skill_name}/"
+            )
+            task = asyncio.create_task(
+                self.generate_async(
+                    skill_prompt,
+                    system=SKILL_BUILDER,
+                    _log=False,
+                    tools=["execute_code", "search_web"],
+                )
+            )
+            self._background_tasks[subagent_id] = BackgroundTask(
+                id=subagent_id,
+                future=task,
+                prompt=f"build_skill:{skill_name}",
+                started_at=time.time(),
+            )
+            return f"Skill '{skill_name}' capture started in background."
+
+        if name == "notify":
+            message = args.get("message", "")
+            level = args.get("level", "info")
+            self.emit("agent_notify", message, {"level": level})
+            return "Notified."
+
+        if name == "search_web":
+            subagent_id = self._next_subagent_id()
+            return await self.search_async(
+                args.get("query", ""),
+                stream=self.stream_subagents,
+                subagent_id=subagent_id,
+            )
+
+        if name == "verify_answer":
+            if self._pending_user_questions:
+                pending = ", ".join(self._pending_user_questions)
+                return f"ERROR: Cannot verify - awaiting user response to pending questions: {pending}. Wait for ask_user responses first."
+            answer = args.get("answer", "")
+            if not self.rubric:
+                return "ERROR: No rubric created. Call create_rubric first."
+            verification_prompt = f"## Rubric\n{self.rubric}\n\n## Answer\n{answer}"
+            if self._user_clarifications:
+                clarifications_text = "\n".join(
+                    f"- Q: {c['questions']} → A: {c['response']}"
+                    for c in self._user_clarifications
+                )
+                verification_prompt += (
+                    "\n\n## User Clarifications\n"
+                    "The user provided these clarifications during execution. Rubric may be stale "
+                    "around these points - verify intent based on clarifications, not just literal "
+                    f"rubric criteria:\n{clarifications_text}"
+                )
+            return await self.generate_async(
+                verification_prompt,
+                system=VERIFICATION,
+                _log=False,
+                stream=self.stream,
+                stream_event_type="verification_chunk",
+            )
+
+        if name == "submit_answer":
+            self.submitted_answer = args.get("answer", "")
+            return "SUBMITTED"
+
+        if name == "verify_exploration":
+            if self._pending_user_questions:
+                pending = ", ".join(self._pending_user_questions)
+                return f"ERROR: Cannot verify - awaiting user response to pending questions: {pending}. Wait for ask_user responses first."
+            takes = args.get("takes", "")
+            verifier_prompt = self.rubric if self.rubric else EXPLORE_VERIFIER
+            verification_prompt = f"## Exploration Output\n{takes}"
+            return await self.generate_async(verification_prompt, system=verifier_prompt, _log=False)
+
+        if name == "search_files" and not self._is_remote_executor():
+            query = args.get("query", "")
+            path = args.get("path", ".")
+            return await self.search_files_async(query, path)
+
+        return await asyncio.to_thread(self._execute_tool, name, args)
+
     def _execute_bash(self, command: str, working_directory: str = None) -> str:
         """Execute a safe bash command for filesystem navigation/search."""
         if not command or not command.strip():
@@ -806,6 +1025,28 @@ class BaseProvider(ABC):
 
         return results, errors
 
+    async def _execute_tools_parallel_async(self, func_calls: list[FunctionCall], step_desc: str) -> tuple[list[str], set[int]]:
+        """Execute tools in parallel (async), return results and error indices."""
+        raw_results = await asyncio.gather(
+            *[self._execute_tool_async(fc.name, fc.args) for fc in func_calls],
+            return_exceptions=True,
+        )
+
+        results: list[str] = []
+        errors: set[int] = set()
+        for i, value in enumerate(raw_results):
+            if isinstance(value, Exception):
+                self._debug_log(f"_execute_tool_async({func_calls[i].name}) failed at {step_desc} | error: {value}")
+                results.append(f"Error: {value}")
+                errors.add(i)
+            else:
+                results.append(value)
+
+        for i, fc in enumerate(func_calls):
+            self.log("tool_error" if i in errors else "tool_response", f"{fc.name} -> {results[i]}")
+
+        return results, errors
+
     # === Context compaction ===
     _pending_compaction = None  # Future from executor
     _pending_context_snapshot: object = None  # Context state when compaction started
@@ -845,12 +1086,11 @@ class BaseProvider(ABC):
         self._pending_keep_recent = keep_recent
         self._pending_context_snapshot = context
 
-        # Run Gemini summarization in thread pool
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            self._pending_compaction = executor.submit(
-                self._run_gemini_compaction_sync,
-                xml_content
-            )
+        # Submit to long-lived executor so this remains non-blocking.
+        self._pending_compaction = self._compaction_executor.submit(
+            self._run_gemini_compaction_sync,
+            xml_content,
+        )
 
     def _build_compaction_xml(self, context: object, start_idx: int, end_idx: int) -> str:
         """Build structured XML from context section for LLM summarization."""
@@ -1011,6 +1251,67 @@ class BaseProvider(ABC):
         self.log("system", f"[{mode.name.title()} Mode] {system[:200]}...")
 
         return self._orchestrator_loop(task, system, tool_names, max_iterations)
+
+    async def run_with_mode_async(
+        self,
+        task: Prompt,
+        mode: ModeConfig,
+        enable_search: bool = False,
+        enable_bash: bool = False,
+        enable_code: bool = False,
+        enable_ask_user: bool = False,
+        max_iterations: int = 30,
+        stream: bool = False,
+        stream_subagents: bool = False,
+        **mode_kwargs,
+    ) -> str:
+        """Async orchestrator entrypoint."""
+        if mode.rubric_strategy not in ("pre_create", "provided"):
+            self.rubric = None
+        self.submitted_answer = None
+        self._brief_created = False
+        self.mode = mode.name
+        self.enable_search = enable_search
+        self.stream = stream
+        self.stream_subagents = stream_subagents
+
+        tool_names = get_tools_for_mode(mode, enable_search, enable_bash, enable_code, enable_ask_user)
+        has_skills = bool(self._skills_dir and self._skill_index)
+        system = PROMPTS[mode.orchestrator_prompt]
+
+        if mode.prompt_kwargs:
+            task_text = _prompt_to_log(task)
+            format_args = {"task": task_text}
+            format_args.update(mode_kwargs)
+            system = system.format(**format_args)
+
+        if mode.name == "explore":
+            num_takes = mode_kwargs.get("num_takes", 0)
+            if num_takes > 0:
+                system = system.replace(
+                    "## MINIMUM TAKES",
+                    f"## TARGET TAKES\nGenerate approximately {num_takes} takes.\n\n## MINIMUM TAKES",
+                )
+
+        if has_skills:
+            system += self._skill_index
+            system += "\nYou can pass `skill=<name>` to delegate to inject a skill's approach and code into the delegate's context."
+        else:
+            system += "\n\n## SKILLS\nNo learned skills yet. Use build_skill(name, context) after solving a task to capture reusable approaches. Do NOT pass `skill` to delegate."
+
+        if enable_code and self.code_executor and hasattr(self.code_executor, "get_sandbox_context"):
+            sandbox_ctx = self.code_executor.get_sandbox_context()
+            if sandbox_ctx:
+                system += f"\n\n## CODE EXECUTION ENVIRONMENT\n{sandbox_ctx}\nWrite code compatible with this environment."
+
+        if enable_ask_user:
+            system += ASK_USER_ADDENDUM
+
+        task_text = _prompt_to_log(task)
+        self.log("user", task_text)
+        self.log("system", f"[{mode.name.title()} Mode] {system[:200]}...")
+
+        return await self._orchestrator_loop_async(task, system, tool_names, max_iterations)
 
     # === Legacy methods for backwards compatibility ===
     def run_orchestrator(
@@ -1179,6 +1480,87 @@ class BaseProvider(ABC):
 
         return self.submitted_answer or "Max iterations reached"
 
+    async def _orchestrator_loop_async(
+        self,
+        task: Prompt,
+        system: str,
+        tool_names: list[str],
+        max_iterations: int,
+        _context: object = None,
+        _start_iteration: int = 0,
+    ) -> str:
+        """Async orchestrator loop."""
+        context = _context if _context is not None else self._init_context(task, system, tool_names)
+        last_tools = []
+
+        if self._checkpoint and not self._run_id:
+            self._run_id = uuid.uuid4().hex[:12]
+
+        for iteration in range(_start_iteration, max_iterations):
+            if self._checkpoint:
+                snap_id = f"{self._run_id}:step:{iteration}"
+                self.snapshots[snap_id] = Snapshot(
+                    id=snap_id,
+                    step=iteration,
+                    context=copy.deepcopy(context),
+                    state={
+                        "rubric": self.rubric,
+                        "brief": self.brief,
+                        "submitted_answer": self.submitted_answer,
+                        "_brief_created": self._brief_created,
+                        "mode": self.mode,
+                    },
+                    history_index=len(self.history),
+                    tool_names=list(tool_names),
+                    system=system,
+                )
+
+            step_desc = f"iteration {iteration}" + (f" (after {', '.join(last_tools)})" if last_tools else "")
+
+            try:
+                func_calls, output_text = await self._call_model_async(context, step_desc, stream=self.stream)
+            except Exception as e:
+                self._debug_log(f"_call_model_async failed at {step_desc} | error: {e}")
+                self.log("tool_error", f"orchestrator {step_desc}: {e}")
+                raise
+
+            if not func_calls:
+                return output_text or self.submitted_answer or ""
+
+            if self.submitted_answer:
+                return self.submitted_answer
+
+            last_tools = [fc.name for fc in func_calls]
+            results, _ = await self._execute_tools_parallel_async(func_calls, step_desc)
+            self._append_tool_results(context, func_calls, results)
+
+            for tid in list(self._background_tasks):
+                bt = self._background_tasks[tid]
+                if bt.future.done():
+                    self._background_tasks.pop(tid)
+                    try:
+                        bg_result = bt.future.result()
+                        self._inject_feedback(
+                            context,
+                            f"[Background agent {tid} completed]\nTask: {bt.prompt[:300]}\nResult:\n{bg_result}",
+                        )
+                        self.log("tool_response", f"background_{tid} -> {str(bg_result)[:500]}")
+                    except Exception as e:
+                        self._inject_feedback(context, f"[Background agent {tid} failed]: {e}")
+                        self.log("tool_error", f"background_{tid}: {e}")
+
+            context = self._apply_pending_compaction(context)
+            if self._check_compaction_needed(context):
+                self._start_async_compaction(context)
+
+            if self.submitted_answer:
+                return self.submitted_answer
+
+            # Explicit event-loop yield between iterations for fairness.
+            await asyncio.sleep(0)
+
+        return self.submitted_answer or "Max iterations reached"
+
     def resume_from_snapshot(
         self,
         snapshot: Snapshot,
@@ -1240,6 +1622,63 @@ class BaseProvider(ABC):
             for fc in func_calls:
                 if fc.name in ("bash", "read_file"):
                     results.append(self._execute_tool(fc.name, fc.args))
+                else:
+                    results.append(f"Unknown tool: {fc.name}")
+
+            self._append_tool_results(context, func_calls, results)
+
+        return "File search reached max iterations."
+
+    async def resume_from_snapshot_async(
+        self,
+        snapshot: Snapshot,
+        feedback: str | None = None,
+        max_iterations: int = 30,
+    ) -> str:
+        """Async resume orchestrator from a snapshot."""
+        context = copy.deepcopy(snapshot.context)
+        self.rubric = snapshot.state["rubric"]
+        self.brief = snapshot.state["brief"]
+        self.submitted_answer = snapshot.state["submitted_answer"]
+        self._brief_created = snapshot.state["_brief_created"]
+        self.mode = snapshot.state["mode"]
+        self.history = self.history[:snapshot.history_index]
+        self._run_id = uuid.uuid4().hex[:12]
+
+        if feedback:
+            self._inject_feedback(context, feedback)
+            self.log("user", f"[Resume feedback] {feedback}")
+
+        self.log("system", f"[Resume] from {snapshot.id}, step {snapshot.step}")
+        return await self._orchestrator_loop_async(
+            task="",
+            system=snapshot.system,
+            tool_names=snapshot.tool_names,
+            max_iterations=max_iterations,
+            _context=context,
+            _start_iteration=snapshot.step,
+        )
+
+    async def search_files_async(self, query: str, path: str = ".") -> str:
+        """Async file search subagent."""
+        prompt = f"Search in directory: {path}\n\nQuery: {query}"
+        tool_names = ["bash", "read_file"]
+        context = self._init_context(prompt, FILE_SEARCH_AGENT, tool_names)
+
+        for iteration in range(15):
+            try:
+                func_calls, output_text = await self._call_model_async(context, f"file_search_{iteration}")
+            except Exception as e:
+                self._debug_log(f"search_files_async failed at iteration {iteration} | error: {e}")
+                return f"Error searching files: {e}"
+
+            if not func_calls:
+                return output_text or "No results found."
+
+            results = []
+            for fc in func_calls:
+                if fc.name in ("bash", "read_file"):
+                    results.append(await self._execute_tool_async(fc.name, fc.args))
                 else:
                     results.append(f"Unknown tool: {fc.name}")
 

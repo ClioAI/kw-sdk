@@ -19,6 +19,17 @@ result = RLHarness().run_single("What is 2+2?")
 print(result.answer)
 ```
 
+```python
+import asyncio
+from verif import AsyncRLHarness
+
+async def main():
+    result = await AsyncRLHarness(provider="openai").run_single("What is 2+2?")
+    print(result.answer)
+
+asyncio.run(main())
+```
+
 ## Usage
 
 ### With Provider Config
