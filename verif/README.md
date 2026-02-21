@@ -90,7 +90,6 @@ result = harness.run_single(
 | `rubric` | `str \| None` | `None` | Pre-set evaluation rubric |
 | `on_event` | `callable` | `None` | Event callback for streaming |
 | `attachments` | `list[Attachment]` | `[]` | Files to include with task |
-| `checkpoint` | `bool` | `False` | Enable state checkpointing (pass to `run_single()`) |
 
 ## Wrapper Responsibilities
 
@@ -328,27 +327,18 @@ harness = RLHarness(
 - **Artifacts**: Files saved to `artifacts_dir` are tracked and returned in result
 - **Libraries**: Common packages available (pandas, openpyxl, matplotlib, etc.)
 
-### Checkpointing & Resume
+## Providers
 
-```python
-from verif import RLHarness
-
-harness = RLHarness(provider="gemini", enable_search=True)
-
-# Run with checkpointing enabled
-result = harness.run_single("Analyze Greek mythology power dynamics.", checkpoint=True)
-
-# Inspect available checkpoints
-for snap_id, snap in harness.snapshots.items():
-    print(f"{snap_id} (step {snap.step})")
-
-# Resume from a checkpoint with feedback
-resumed = harness.resume(
-    checkpoint_id="<snap_id>",
-    feedback="Focus more on the Trojan War rivalries.",
-    rubric_update="Must include Achilles and divine intervention.",
-)
-```
+| Feature | Gemini | OpenAI | Anthropic |
+|---------|--------|--------|-----------|
+| Model | `gemini-3-flash-preview` | `gpt-5.2` | `claude-sonnet-4-5-20250929` |
+| Thinking | Thinking levels (LOW/MEDIUM/HIGH) | Reasoning effort (low/medium/high) | Extended thinking (budget_tokens) |
+| Web Search | Native (Google Search + URL Context) | Native (web_search tool) | Native (`web_search_20250305` server-side tool) |
+| Vision | Direct upload via Files API | Base64 image blocks | Base64 image blocks |
+| PDF | Direct upload via Files API | pdftotext fallback | Native document blocks |
+| Context Window | 1M tokens | 1M tokens | 200K tokens |
+| Compaction | Gemini (self) | Gemini (cross-provider) | Gemini (cross-provider) |
+| Tool Choice | `ANY` → `AUTO` after verify | N/A (always auto) | `auto` only (thinking incompatible with `any`) |
 
 ## Exports
 
@@ -360,5 +350,4 @@ from verif import (
     HistoryEntry,   # Event type
     Attachment,     # File attachment
 )
-from verif.config import Snapshot  # Checkpoint state
 ```

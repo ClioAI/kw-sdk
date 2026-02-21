@@ -54,6 +54,7 @@ class GeminiProvider(BaseProvider):
         """
         func_calls = []
         text_parts = []
+        thinking_parts = []
         accumulated_parts = []
         meta = meta or {}
 
@@ -78,6 +79,7 @@ class GeminiProvider(BaseProvider):
 
                 # Thinking chunk - only from orchestrator (extract_function_calls=True)
                 if extract_function_calls and hasattr(part, "thought") and part.thought and part.text:
+                    thinking_parts.append(part.text)
                     self.emit("thinking", part.text)
 
                 # Function call (only for orchestrator) - arrives complete without FC streaming
@@ -91,6 +93,8 @@ class GeminiProvider(BaseProvider):
                         ))
                         self.log("tool_call", f"{fc.name}({dict(fc.args) if fc.args else {}})")
 
+        if thinking_parts:
+            self.log("thinking", "".join(thinking_parts))
         accumulated_content = types.Content(role="model", parts=accumulated_parts) if accumulated_parts else None
         return "".join(text_parts), func_calls, accumulated_content
 
@@ -114,7 +118,7 @@ class GeminiProvider(BaseProvider):
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
-                 stream_meta: dict = None) -> str:
+                 stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
         if _log:
             self.log("user", prompt)
             if system:
@@ -128,6 +132,9 @@ class GeminiProvider(BaseProvider):
                 types.Tool(google_search=types.GoogleSearch()),
                 types.Tool(url_context=types.UrlContext()),
             ]
+        elif tools:
+            tool_decls = [self.get_tool_definition(t) for t in tools]
+            config.tools = [types.Tool(function_declarations=tool_decls)]
 
         # Streaming path - emit events without storing in history
         if stream:
@@ -146,7 +153,7 @@ class GeminiProvider(BaseProvider):
                 self.emit("subagent_end", text, meta)
             return text
 
-        # Blocking path (existing)
+        # Blocking path
         try:
             response = retry_on_error(
                 lambda: self.client.models.generate_content(model=MODEL_ID, contents=prompt, config=config),
@@ -160,6 +167,20 @@ class GeminiProvider(BaseProvider):
 
         if _log:
             self._log_response(response)
+
+        # If model made tool calls, execute and synthesize
+        if tools and response.function_calls:
+            results = []
+            for fc in response.function_calls:
+                self.log("tool_call", f"delegate:{fc.name}({dict(fc.args) if fc.args else {}})")
+                result = self._execute_tool(fc.name, dict(fc.args) if fc.args else {})
+                self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                results.append(f"{fc.name}: {result}")
+            next_tools = tools if _tool_depth < 5 else None
+            return self.generate(
+                prompt + "\n\nTool results:\n" + "\n".join(results),
+                system=system, _log=False, tools=next_tools, _tool_depth=_tool_depth + 1,
+            )
 
         result = response.text or ""
         if enable_search and response.candidates:

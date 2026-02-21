@@ -14,9 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 from ..prompts import (
     BRIEF_CREATOR, RUBRIC_CREATOR, VERIFICATION, FILE_SEARCH_AGENT, COMPACTION_SUMMARIZER,
     EXPLORE_ORCHESTRATOR, EXPLORE_BRIEF, EXPLORE_VERIFIER, ORCHESTRATOR, ORCHESTRATOR_WITH_PLAN,
-    ITERATE_ORCHESTRATOR, ASK_USER_ADDENDUM
+    ITERATE_ORCHESTRATOR, ASK_USER_ADDENDUM, SKILL_BUILDER,
 )
-from ..config import Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot
+from ..config import Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot, BackgroundTask
 from ..modes import get_mode, get_tools_for_mode
 
 if TYPE_CHECKING:
@@ -34,6 +34,7 @@ PROMPTS = {
     "RUBRIC_CREATOR": RUBRIC_CREATOR,
     "VERIFICATION": VERIFICATION,
     "EXPLORE_VERIFIER": EXPLORE_VERIFIER,
+    "SKILL_BUILDER": SKILL_BUILDER,
 }
 
 
@@ -126,15 +127,76 @@ TOOL_DEFINITIONS = {
             "required": ["brief"],
         },
     },
-    "spawn_subagent": {
-        "name": "spawn_subagent",
-        "description": "Spawn a subagent to handle a specific subtask. Use for decomposing complex tasks.",
+    "delegate": {
+        "name": "delegate",
+        "description": "Delegate a subtask. Without tools: single LLM call for quick synthesis. "
+                       "With tools: single round — model calls tools, then synthesizes. No loop. "
+                       "Set background=true for async.",
         "parameters": {
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "The task prompt for the subagent. Be specific."},
+                "prompt": {
+                    "type": "string",
+                    "description": "Complete instructions for the delegate. Be specific about "
+                                   "expected output.",
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["execute_code", "bash"],
+                    },
+                    "description": "Tools for the delegate. Omit for single LLM call. "
+                                   "search_web/search_files are NOT valid — call them directly.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run in background. Results delivered asynchronously.",
+                },
+                "skill": {
+                    "type": "string",
+                    "description": "Skill name. SDK reads skill.md + script.py and injects into delegate context.",
+                },
             },
             "required": ["prompt"],
+        },
+    },
+    "build_skill": {
+        "name": "build_skill",
+        "description": "Capture a reusable skill from what was learned. Always runs in background. "
+                       "Produces skill.md + script.py with tested code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "context": {
+                    "type": "string",
+                    "description": "What was learned: approach, key insights, working code snippets. "
+                                   "Include everything the skill builder needs to generalize.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Skill name (becomes folder name). Lowercase with underscores.",
+                },
+            },
+            "required": ["context", "name"],
+        },
+    },
+    "notify": {
+        "name": "notify",
+        "description": "Send a progress update or alert to the user.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "The update message."},
+                "level": {
+                    "type": "string",
+                    "enum": ["info", "alert"],
+                    "default": "info",
+                    "description": "'info' for progress, 'alert' for important findings.",
+                },
+            },
+            "required": ["message"],
         },
     },
     "search_web": {
@@ -320,7 +382,7 @@ class BaseProvider(ABC):
         self.submitted_answer: str | None = None
         self.on_log: callable = None
         self.code_executor: "CodeExecutor | None" = None  # Set by harness if enable_code=True
-        self.enable_search: bool = False  # Set by harness, used by spawn_subagent
+        self.enable_search: bool = False  # Set by harness, used by delegate
         self.compaction_config = CompactionConfig()  # Default config
         self._brief_created = False  # Track if brief has been created
         self._brief_counter: int = 0
@@ -339,6 +401,13 @@ class BaseProvider(ABC):
         self.snapshots: dict[str, Snapshot] = {}
         self._checkpoint: bool = False
         self._run_id: str = ""
+        # Delegation & background
+        self._background_tasks: dict[str, BackgroundTask] = {}
+        self._bg_executor = ThreadPoolExecutor(max_workers=3)
+        # Skills
+        self._skill_index: str = ""  # Injected by harness
+        self._skills_dir: str = ""  # Set by harness
+        self._skill_output_dir: str = ""  # artifacts_dir + /learned_skills
 
     def _next_subagent_id(self) -> str:
         """Generate unique ID for subagent tracking."""
@@ -378,6 +447,7 @@ class BaseProvider(ABC):
         self._user_response_events = {}
         self._pending_user_questions = set()
         self._user_clarifications = []
+        self._background_tasks = {}
 
     def get_history_text(self) -> str:
         lines = []
@@ -457,15 +527,68 @@ class BaseProvider(ABC):
                 self.rubric = f"ERROR: {e}"
                 raise
 
-        elif name == "spawn_subagent":
+        elif name == "delegate":
             prompt = args.get("prompt", "")
-            if self.enable_search:
-                prompt = prompt + "\n\nYou have web search available. Use it to find information."
+            tools = args.get("tools") or None
+            background = args.get("background", False)
             subagent_id = self._next_subagent_id()
+
+            # Inject skill if provided
+            skill_name = args.get("skill")
+            if skill_name:
+                if self._skills_dir:
+                    from pathlib import Path
+                    skill_dir = Path(self._skills_dir) / skill_name
+                    if skill_dir.exists():
+                        from ..skills import inject_skill
+                        prompt = inject_skill(prompt, skill_name, self._skills_dir)
+                    else:
+                        self.log("tool_response", f"Skill '{skill_name}' not found, proceeding without it.")
+                else:
+                    self.log("tool_response", f"No skills configured, ignoring skill='{skill_name}'.")
+
+            if background:
+                future = self._bg_executor.submit(
+                    lambda p=prompt, t=tools: self.generate(
+                        p, _log=False, enable_search=self.enable_search if not t else False,
+                        subagent_id=subagent_id, tools=t,
+                    ),
+                )
+                self._background_tasks[subagent_id] = BackgroundTask(
+                    id=subagent_id, future=future, prompt=prompt, started_at=time.time(),
+                )
+                return f"Agent {subagent_id} running in background. Results delivered when ready."
+
             return self.generate(
-                prompt, _log=False, enable_search=self.enable_search,
-                stream=self.stream_subagents, subagent_id=subagent_id
+                prompt, _log=False, enable_search=self.enable_search if not tools else False,
+                stream=self.stream_subagents, subagent_id=subagent_id, tools=tools,
             )
+
+        elif name == "build_skill":
+            context_text = args.get("context", "")
+            skill_name = args.get("name", "unnamed_skill")
+            subagent_id = self._next_subagent_id()
+            skill_prompt = (
+                f"Skill name: {skill_name}\n\n"
+                f"Learning context:\n{context_text}\n\n"
+                f"Save to: {self._skill_output_dir}/{skill_name}/"
+            )
+            future = self._bg_executor.submit(
+                lambda: self.generate(
+                    skill_prompt, system=SKILL_BUILDER, _log=False, tools=["execute_code", "search_web"],
+                ),
+            )
+            self._background_tasks[subagent_id] = BackgroundTask(
+                id=subagent_id, future=future,
+                prompt=f"build_skill:{skill_name}", started_at=time.time(),
+            )
+            return f"Skill '{skill_name}' capture started in background."
+
+        elif name == "notify":
+            message = args.get("message", "")
+            level = args.get("level", "info")
+            self.emit("agent_notify", message, {"level": level})
+            return "Notified."
 
         elif name == "search_web":
             subagent_id = self._next_subagent_id()
@@ -845,6 +968,8 @@ class BaseProvider(ABC):
         # Get tools for this mode
         tool_names = get_tools_for_mode(mode, enable_search, enable_bash, enable_code, enable_ask_user)
 
+        has_skills = bool(self._skills_dir and self._skill_index)
+
         # Get orchestrator prompt
         system = PROMPTS[mode.orchestrator_prompt]
         
@@ -863,6 +988,13 @@ class BaseProvider(ABC):
                     "## MINIMUM TAKES",
                     f"## TARGET TAKES\nGenerate approximately {num_takes} takes.\n\n## MINIMUM TAKES"
                 )
+
+        # Inject skill context — build_skill always available, skill= for delegate only when skills exist
+        if has_skills:
+            system += self._skill_index
+            system += "\nYou can pass `skill=<name>` to delegate to inject a skill's approach and code into the delegate's context."
+        else:
+            system += "\n\n## SKILLS\nNo learned skills yet. Use build_skill(name, context) after solving a task to capture reusable approaches. Do NOT pass `skill` to delegate."
 
         # Inject sandbox context if using RemoteExecutor
         if enable_code and self.code_executor and hasattr(self.code_executor, "get_sandbox_context"):
@@ -1019,6 +1151,22 @@ class BaseProvider(ABC):
             results, _ = self._execute_tools_parallel(func_calls, step_desc)
             self._append_tool_results(context, func_calls, results)
 
+            # Poll completed background tasks
+            for tid in list(self._background_tasks):
+                bt = self._background_tasks[tid]
+                if bt.future.done():
+                    self._background_tasks.pop(tid)
+                    try:
+                        bg_result = bt.future.result()
+                        self._inject_feedback(
+                            context,
+                            f"[Background agent {tid} completed]\nTask: {bt.prompt[:300]}\nResult:\n{bg_result}",
+                        )
+                        self.log("tool_response", f"background_{tid} -> {bg_result[:500]}")
+                    except Exception as e:
+                        self._inject_feedback(context, f"[Background agent {tid} failed]: {e}")
+                        self.log("tool_error", f"background_{tid}: {e}")
+
             # Apply pending compaction if ready
             context = self._apply_pending_compaction(context)
 
@@ -1103,10 +1251,10 @@ class BaseProvider(ABC):
     @abstractmethod
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
-                 stream_meta: dict = None) -> str:
-        """Simple generation without tools. If stream=True, emit streaming events.
-        stream_event_type overrides the default event type (subagent_chunk).
-        stream_meta is forwarded as metadata on each chunk event."""
+                 stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
+        """Generation. When tools provided (e.g. ["execute_code", "bash"]):
+        iterates tool calls up to 5 rounds, then synthesizes. Returns clean text.
+        Like search(), the caller gets clean text back. Tools are a black box."""
         pass
 
     @abstractmethod

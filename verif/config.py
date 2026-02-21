@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Union, Callable, Any
+from concurrent.futures import Future
 
 
 @dataclass
@@ -69,3 +70,20 @@ class CompactionConfig:
     threshold: float = 0.8  # Trigger at 80% of max context
     keep_recent_turns: int = 3  # Keep last N tool exchanges verbatim
     max_summary_tokens: int = 1000  # Max tokens for summary section
+
+
+@dataclass
+class BackgroundTask:
+    id: str
+    future: Future
+    prompt: str
+    started_at: float
+
+
+@dataclass
+class SkillMatch:
+    name: str
+    type: str  # "utility" | "workflow"
+    description: str
+    approach: str  # body of skill.md
+    dir_path: str  # path to skill directory

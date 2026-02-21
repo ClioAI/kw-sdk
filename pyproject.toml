@@ -11,10 +11,14 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.scripts]
+verif = "cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pyinstaller>=6.0.0",
 ]
 
 [build-system]

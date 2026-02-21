@@ -150,14 +150,18 @@ class AnthropicProvider(BaseProvider):
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
-                 stream_meta: dict = None) -> str:
+                 stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
         if _log:
             self.log("user", prompt)
             if system:
                 self.log("system", system)
 
         messages = [{"role": "user", "content": prompt}]
-        tools = [WEB_SEARCH_TOOL] if enable_search else None
+        api_tools = None
+        if enable_search:
+            api_tools = [WEB_SEARCH_TOOL]
+        if tools:
+            api_tools = [_to_anthropic_tool(self.get_tool_definition(t)) for t in tools]
 
         # Streaming path - emit events without storing in history
         if stream:
@@ -169,7 +173,7 @@ class AnthropicProvider(BaseProvider):
             text, _, _ = self._stream_generate(
                 messages=messages,
                 system=system or "",
-                tools=tools,
+                tools=api_tools,
                 event_type=event_type,
                 meta=meta,
             )
@@ -187,8 +191,8 @@ class AnthropicProvider(BaseProvider):
         }
         if system:
             kwargs["system"] = system
-        if tools:
-            kwargs["tools"] = tools
+        if api_tools:
+            kwargs["tools"] = api_tools
 
         try:
             response = retry_on_error(
@@ -203,6 +207,22 @@ class AnthropicProvider(BaseProvider):
 
         if _log:
             self._log_response(response)
+
+        # If model made tool calls, execute and synthesize
+        if tools:
+            func_calls = [b for b in response.content if b.type == "tool_use"]
+            if func_calls:
+                results = []
+                for fc in func_calls:
+                    self.log("tool_call", f"delegate:{fc.name}({fc.input})")
+                    result = self._execute_tool(fc.name, fc.input or {})
+                    self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                    results.append(f"{fc.name}: {result}")
+                next_tools = tools if _tool_depth < 5 else None
+                return self.generate(
+                    prompt + "\n\nTool results:\n" + "\n".join(results),
+                    system=system, _log=False, tools=next_tools, _tool_depth=_tool_depth + 1,
+                )
 
         return self._extract_text_with_citations(response)
 

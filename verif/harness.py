@@ -9,10 +9,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .config import ProviderConfig, Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot
+from .config import ProviderConfig, Prompt, Attachment, CompactionConfig, ModeConfig, Snapshot, SkillMatch
 from .providers.base import BaseProvider, HistoryEntry, PlanResult, _prompt_to_log
 from .executor import CodeExecutor
 from .modes import get_mode, MODES
+from .skills import build_skill_index, parse_skills, extract_rubric
 
 
 def load_provider(config: ProviderConfig) -> BaseProvider:
@@ -69,6 +70,7 @@ class RLHarness:
         enable_ask_user: bool = False,
         code_executor: CodeExecutor | None = None,
         artifacts_dir: str = "./artifacts",
+        skills_dir: str | None = None,
         max_iterations: int = 30,
         default_mode: str = "standard",  # Renamed from plan_mode for clarity
         rubric: str | None = None,
@@ -87,6 +89,7 @@ class RLHarness:
             enable_ask_user: Enable ask_user tool
             code_executor: Code executor instance (required if enable_code=True)
             artifacts_dir: Directory for artifacts
+            skills_dir: Directory containing reusable skills (scanned at init)
             max_iterations: Max orchestrator iterations
             default_mode: Default mode ("standard", "plan", "explore")
             rubric: Pre-set rubric (optional)
@@ -102,12 +105,14 @@ class RLHarness:
         self.enable_code = enable_code
         self.enable_ask_user = enable_ask_user
         self.artifacts_dir = artifacts_dir
+        self.skills_dir = skills_dir
         self.max_iterations = max_iterations
         self.default_mode = default_mode
         self.stream = stream
         self.stream_subagents = stream_subagents
         self.history: list[HistoryEntry] = []
-        
+        self._skills: list[SkillMatch] = []  # Parsed skill metadata
+
         if rubric:
             self.provider.rubric = rubric
         if on_event:
@@ -121,6 +126,13 @@ class RLHarness:
                 "enable_code=True requires a code_executor. "
                 "Use SubprocessExecutor(artifacts_dir) for unsandboxed local execution."
             )
+
+        # Skills setup
+        if skills_dir:
+            self.provider._skills_dir = skills_dir
+            self.provider._skill_index = build_skill_index(skills_dir)
+            self._skills = parse_skills(skills_dir)
+        self.provider._skill_output_dir = os.path.join(artifacts_dir, "learned_skills")
 
     def _sync_history(self):
         self.history = self.provider.history.copy()
@@ -164,15 +176,29 @@ class RLHarness:
         mode_name = mode or self.default_mode
         mode_config = get_mode(mode_name)
         task_text = _prompt_to_log(task)
-        
+
         self.provider.clear_history()
         self.provider._checkpoint = checkpoint
         self.provider._run_id = ""
         self.provider.snapshots = {}
 
+        # Check for workflow skill match (only when no plan/mode override)
+        if not plan and mode_name == "standard" and self._skills:
+            matched = self._match_workflow_skill(task_text)
+            if matched:
+                playbook = matched.approach
+                skill_rubric = extract_rubric(playbook)
+                return self.run_single(
+                    task, ground_truth,
+                    mode="plan",
+                    plan=playbook,
+                    rubric=rubric or skill_rubric,
+                    checkpoint=checkpoint,
+                )
+
         # Collect mode-specific kwargs for orchestrator
         mode_kwargs = {}
-        
+
         # Handle plan mode: plan is required, passed directly
         if mode_config.name == "plan":
             if not plan:
@@ -419,3 +445,29 @@ class RLHarness:
     def get_mode_config(name: str) -> ModeConfig:
         """Get mode configuration by name."""
         return get_mode(name)
+
+    # =========================================================================
+    # SKILLS
+    # =========================================================================
+
+    def _match_workflow_skill(self, task: str) -> SkillMatch | None:
+        """Match task to a workflow skill via single LLM call."""
+        workflow_skills = [s for s in self._skills if s.type == "workflow"]
+        if not workflow_skills:
+            return None
+        descriptions = "\n".join(
+            f"- {s.name}: {s.description}" for s in workflow_skills
+        )
+        prompt = (
+            f"Given this task:\n{task}\n\n"
+            f"Which workflow skill (if any) is a good match?\n{descriptions}\n\n"
+            f"Reply with ONLY the skill name, or 'none' if no match."
+        )
+        result = self.provider.generate(prompt, _log=False)
+        match_name = result.strip().lower().replace("'", "").replace('"', '')
+        if match_name == "none":
+            return None
+        for s in workflow_skills:
+            if s.name.lower() == match_name:
+                return s
+        return None
