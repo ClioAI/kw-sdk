@@ -119,7 +119,10 @@ async def main():
 
     print(f"\nResults saved to {output_path}")
     if error:
-        print("RUN FAILED - see output for details")
+        print("RUN FAILED")
+        print("\nERROR DETAILS")
+        print("=" * 60)
+        print(error)
     elif result:
         print(f"\nAnswer preview: {result.answer[:200]}...")
 
