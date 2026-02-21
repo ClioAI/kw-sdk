@@ -3,7 +3,7 @@ import logging
 from google import genai
 from google.genai import types
 
-from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error
+from .base import BaseProvider, FunctionCall, TOOL_DEFINITIONS, retry_on_error, async_retry_on_error
 from ..prompts import SEARCH_AGENT
 from ..config import Prompt, Attachment
 from dotenv import load_dotenv
@@ -115,6 +115,59 @@ class GeminiProvider(BaseProvider):
             tool_config=tool_config,
         )
 
+    async def _stream_generate_async(
+        self,
+        contents,
+        config: types.GenerateContentConfig,
+        event_type: str = "model_chunk",
+        meta: dict = None,
+        extract_function_calls: bool = False,
+    ) -> tuple[str, list[FunctionCall], types.Content | None]:
+        """Async streaming logic using client.aio."""
+        func_calls = []
+        text_parts = []
+        thinking_parts = []
+        accumulated_parts = []
+        meta = meta or {}
+
+        stream = await self.client.aio.models.generate_content_stream(
+            model=MODEL_ID,
+            contents=contents,
+            config=config,
+        )
+        async for chunk in stream:
+            if not chunk.candidates:
+                continue
+            parts = getattr(chunk.candidates[0].content, "parts", None)
+            if not parts:
+                continue
+
+            for part in parts:
+                accumulated_parts.append(part)
+
+                if hasattr(part, "text") and part.text and not getattr(part, "thought", False):
+                    text_parts.append(part.text)
+                    self.emit(event_type, part.text, meta if meta else None)
+
+                if extract_function_calls and hasattr(part, "thought") and part.thought and part.text:
+                    thinking_parts.append(part.text)
+                    self.emit("thinking", part.text)
+
+                if extract_function_calls and hasattr(part, "function_call") and part.function_call:
+                    fc = part.function_call
+                    if fc.name:
+                        func_calls.append(FunctionCall(
+                            name=fc.name,
+                            args=dict(fc.args) if fc.args else {},
+                            raw=fc,
+                        ))
+                        self.log("tool_call", f"{fc.name}({dict(fc.args) if fc.args else {}})")
+
+        if thinking_parts:
+            self.log("thinking", "".join(thinking_parts))
+        accumulated_content = types.Content(role="model", parts=accumulated_parts) if accumulated_parts else None
+        return "".join(text_parts), func_calls, accumulated_content
+
     # === LLM calls ===
     def generate(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
                  stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
@@ -203,6 +256,92 @@ class GeminiProvider(BaseProvider):
                         result += "\n\nURLs fetched:\n" + "\n".join(urls)
         return result
 
+    async def generate_async(self, prompt: str, system: str = None, _log: bool = True, enable_search: bool = False,
+                             stream: bool = False, subagent_id: str = None, stream_event_type: str = None,
+                             stream_meta: dict = None, tools: list[str] = None, _tool_depth: int = 0) -> str:
+        if _log:
+            self.log("user", prompt)
+            if system:
+                self.log("system", system)
+
+        config = types.GenerateContentConfig(thinking_config=self._thinking_config())
+        if system:
+            config.system_instruction = system
+        if enable_search:
+            config.tools = [
+                types.Tool(google_search=types.GoogleSearch()),
+                types.Tool(url_context=types.UrlContext()),
+            ]
+        elif tools:
+            tool_decls = [self.get_tool_definition(t) for t in tools]
+            config.tools = [types.Tool(function_declarations=tool_decls)]
+
+        if stream:
+            event_type = stream_event_type or "subagent_chunk"
+            is_subagent = not stream_event_type
+            meta = stream_meta or ({"subagent_id": subagent_id} if subagent_id else {})
+            if is_subagent:
+                self.emit("subagent_start", prompt, meta)
+            text, _, _ = await self._stream_generate_async(
+                contents=prompt,
+                config=config,
+                event_type=event_type,
+                meta=meta,
+            )
+            if is_subagent:
+                self.emit("subagent_end", text, meta)
+            return text
+
+        try:
+            response = await async_retry_on_error(
+                lambda: self.client.aio.models.generate_content(
+                    model=MODEL_ID,
+                    contents=prompt,
+                    config=config,
+                ),
+                logger=debug_logger,
+            )
+        except Exception as e:
+            debug_logger.error(f"generate_async() failed | prompt: {prompt[:200]}... | error: {e}")
+            if _log:
+                self.log("tool_error", f"generate: {e}")
+            raise
+
+        if _log:
+            self._log_response(response)
+
+        if tools and response.function_calls:
+            results = []
+            for fc in response.function_calls:
+                self.log("tool_call", f"delegate:{fc.name}({dict(fc.args) if fc.args else {}})")
+                result = await self._execute_tool_async(fc.name, dict(fc.args) if fc.args else {})
+                self.log("tool_response", f"delegate:{fc.name} -> {result}")
+                results.append(f"{fc.name}: {result}")
+            next_tools = tools if _tool_depth < 5 else None
+            return await self.generate_async(
+                prompt + "\n\nTool results:\n" + "\n".join(results),
+                system=system, _log=False, tools=next_tools, _tool_depth=_tool_depth + 1,
+            )
+
+        result = response.text or ""
+        if enable_search and response.candidates:
+            gm = response.candidates[0].grounding_metadata
+            if gm and gm.grounding_chunks:
+                sources = [
+                    chunk.web.uri
+                    for chunk in gm.grounding_chunks
+                    if hasattr(chunk, "web") and chunk.web
+                ]
+                if sources:
+                    result += "\n\nSources:\n" + "\n".join(sources)
+            if hasattr(response.candidates[0], "url_context_metadata"):
+                url_meta = response.candidates[0].url_context_metadata
+                if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
+                    urls = [m.retrieved_url for m in url_meta.url_metadata if hasattr(m, "retrieved_url")]
+                    if urls:
+                        result += "\n\nURLs fetched:\n" + "\n".join(urls)
+        return result
+
     def search(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
         config = types.GenerateContentConfig(
             system_instruction=SEARCH_AGENT,
@@ -253,6 +392,60 @@ class GeminiProvider(BaseProvider):
             if sources:
                 result += "\n\nSources:\n" + "\n".join(sources)
         # URL context metadata (from url_context)
+        if response.candidates and hasattr(response.candidates[0], "url_context_metadata"):
+            url_meta = response.candidates[0].url_context_metadata
+            if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
+                urls = [m.retrieved_url for m in url_meta.url_metadata if hasattr(m, "retrieved_url")]
+                if urls:
+                    result += "\n\nURLs fetched:\n" + "\n".join(urls)
+        return result
+
+    async def search_async(self, query: str, stream: bool = False, subagent_id: str = None) -> str:
+        config = types.GenerateContentConfig(
+            system_instruction=SEARCH_AGENT,
+            tools=[
+                types.Tool(google_search=types.GoogleSearch()),
+                types.Tool(url_context=types.UrlContext()),
+            ],
+            thinking_config=self._thinking_config(),
+        )
+
+        if stream:
+            meta = {"subagent_id": subagent_id, "tool": "search_web"} if subagent_id else {}
+            self.emit("subagent_start", query, meta)
+            text, _, _ = await self._stream_generate_async(
+                contents=query,
+                config=config,
+                event_type="subagent_chunk",
+                meta=meta,
+            )
+            self.emit("subagent_end", text, meta)
+            return text
+
+        try:
+            response = await async_retry_on_error(
+                lambda: self.client.aio.models.generate_content(
+                    model=MODEL_ID,
+                    contents=query,
+                    config=config,
+                ),
+                logger=debug_logger,
+            )
+        except Exception as e:
+            debug_logger.error(f"search_async() failed | query: {query} | error: {e}")
+            self.log("tool_error", f"search: {e}")
+            raise
+
+        result = response.text or ""
+        gm = response.candidates[0].grounding_metadata if response.candidates else None
+        if gm and gm.grounding_chunks:
+            sources = [
+                chunk.web.uri
+                for chunk in gm.grounding_chunks
+                if hasattr(chunk, "web") and chunk.web
+            ]
+            if sources:
+                result += "\n\nSources:\n" + "\n".join(sources)
         if response.candidates and hasattr(response.candidates[0], "url_context_metadata"):
             url_meta = response.candidates[0].url_context_metadata
             if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
@@ -444,6 +637,55 @@ class GeminiProvider(BaseProvider):
                 debug_logger.debug(f"part[{i}] {part.function_call.name} sig={'YES' if has_sig else 'NO'}")
 
         # Convert to normalized FunctionCall
+        func_calls = [
+            FunctionCall(name=fc.name, args=dict(fc.args) if fc.args else {}, raw=fc)
+            for fc in response.function_calls
+        ]
+        return func_calls, response.text or ""
+
+    async def _call_model_async(self, context: dict, step_desc: str, stream: bool = False) -> tuple[list[FunctionCall], str]:
+        if self._verification_called:
+            context["config"] = types.GenerateContentConfig(
+                tools=[context["tools"]],
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                thinking_config=self._thinking_config(),
+                system_instruction=context["config"].system_instruction,
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+                ),
+            )
+
+        if stream:
+            config = self._make_streaming_config(context["config"])
+            text, func_calls, content = await self._stream_generate_async(
+                contents=context["contents"],
+                config=config,
+                event_type="model_chunk",
+                extract_function_calls=True,
+            )
+            if content:
+                context["contents"].append(content)
+            return func_calls, text
+
+        response = await async_retry_on_error(
+            lambda: self.client.aio.models.generate_content(
+                model=MODEL_ID,
+                contents=context["contents"],
+                config=context["config"],
+            ),
+            logger=debug_logger,
+        )
+        self._log_response(response)
+
+        if not response.function_calls:
+            return [], response.text or ""
+
+        context["contents"].append(response.candidates[0].content)
+        for i, part in enumerate(getattr(response.candidates[0].content, "parts", None) or []):
+            if hasattr(part, 'function_call') and part.function_call:
+                has_sig = hasattr(part, 'thought_signature') and part.thought_signature
+                debug_logger.debug(f"part[{i}] {part.function_call.name} sig={'YES' if has_sig else 'NO'}")
+
         func_calls = [
             FunctionCall(name=fc.name, args=dict(fc.args) if fc.args else {}, raw=fc)
             for fc in response.function_calls
