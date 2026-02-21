@@ -19,8 +19,20 @@ from .skills import build_skill_index, parse_skills, extract_rubric
 def load_provider(config: ProviderConfig) -> BaseProvider:
     if config.name == "gemini":
         from .providers import gemini
+        from google.genai import types as genai_types
         gemini.GEMINI_API_KEY = config.api_key or os.environ.get("GEMINI_API_KEY")
-        return gemini.GeminiProvider(thinking_level=config.thinking_level)
+        http_options = None
+        if config.gemini_http_options or config.gemini_async_client_args:
+            options_dict = dict(config.gemini_http_options or {})
+            if config.gemini_async_client_args:
+                async_args = dict(options_dict.get("async_client_args") or {})
+                async_args.update(config.gemini_async_client_args)
+                options_dict["async_client_args"] = async_args
+            http_options = genai_types.HttpOptions(**options_dict)
+        return gemini.GeminiProvider(
+            thinking_level=config.thinking_level,
+            http_options=http_options,
+        )
     elif config.name == "openai":
         from .providers import openai as oai
         oai.OPENAI_API_KEY = config.api_key or os.environ.get("OPENAI_API_KEY")

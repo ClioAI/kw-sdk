@@ -25,9 +25,11 @@ if not debug_logger.handlers:
 class GeminiProvider(BaseProvider):
     provider_name = "gemini"
 
-    def __init__(self, thinking_level: str = "MEDIUM"):
+    def __init__(self, thinking_level: str = "MEDIUM", http_options: types.HttpOptions | dict | None = None):
         super().__init__()
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        if isinstance(http_options, dict):
+            http_options = types.HttpOptions(**http_options)
+        self.client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
         self.thinking_level = thinking_level
         self._verification_called = False
 

@@ -448,6 +448,9 @@ harness = RLHarness(
     provider=ProviderConfig(
         name="gemini",
         thinking_level="MEDIUM",  # Gemini: LOW | MEDIUM | HIGH
+        # Optional google-genai HttpOptions pass-through:
+        # gemini_async_client_args={"ssl": True, "cookies": {}},
+        # gemini_http_options={"async_client_args": {"ssl": True}},
         # OR for OpenAI:
         # name="openai",
         # reasoning_effort="medium",  # low | medium | high

@@ -41,6 +41,10 @@ config = ProviderConfig(
     name="gemini",           # "gemini" | "openai" | "anthropic"
     api_key="...",           # Optional, defaults to env var
     thinking_level="HIGH",   # Gemini: LOW/MEDIUM/HIGH
+    # Optional google-genai HttpOptions args:
+    gemini_async_client_args={"ssl": True, "cookies": {}},
+    # Or pass full HttpOptions-compatible dict:
+    # gemini_http_options={"async_client_args": {"ssl": True}},
 )
 harness = RLHarness(provider=config, enable_search=True)
 result = harness.run_single("Research quantum computing")

@@ -38,6 +38,11 @@ class ProviderConfig:
     name: str  # "gemini" | "openai" | "anthropic"
     api_key: str | None = None  # None = read from env
     thinking_level: str = "MEDIUM"  # gemini
+    # Gemini HTTP transport options for google-genai (maps to types.HttpOptions).
+    # Useful for aiohttp tuning, proxy/cookies, SSL, etc.
+    gemini_http_options: dict[str, Any] | None = None
+    # Convenience override merged into gemini_http_options["async_client_args"].
+    gemini_async_client_args: dict[str, Any] | None = None
     reasoning_effort: str = "medium"  # openai
 
 
