@@ -10,7 +10,7 @@ from verif import AsyncRLHarness, ProviderConfig
 from verif.providers import gemini as gemini_provider
 
 # Force the requested model for this test.
-gemini_provider.MODEL_ID = "gemini-3-flash"
+gemini_provider.MODEL_ID = "gemini-3-flash-preview"
 
 # Realistic task that should trigger subagent search behavior.
 TASK = (
